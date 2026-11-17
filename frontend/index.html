@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Kardex</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!-- ============ LOGIN ============ -->
+    <div class="login hidden" id="login">
+      <div class="pane-l">
+        <div class="login-brand">
+          <div class="logo" id="loginLogo"></div>
+          <div class="name">Kardex</div>
+        </div>
+        <div class="form-wrap">
+          <h2>Inicia sesión</h2>
+          <p class="lead">
+            Almacén de refacciones. Usa el <b>mismo usuario y contraseña de Dossier</b>.
+          </p>
+          <div class="field">
+            <label for="loginUser">Usuario (nómina)</label>
+            <input class="input mono" id="loginUser" autocomplete="username" placeholder="ATI3990" />
+          </div>
+          <div class="field">
+            <label for="loginPass">Contraseña</label>
+            <input class="input" type="password" id="loginPass" autocomplete="current-password" />
+          </div>
+          <button class="btn primary" id="loginBtn" style="width: 100%; padding: 13px; margin-top: 8px">
+            Entrar
+          </button>
+          <p id="loginError" class="form-msg" style="text-align: center; margin-top: 12px"></p>
+          <p class="muted" style="font-size: 12px; text-align: center; margin-top: 16px">
+            Roles: <b>almacenista</b> · <b>supervisor</b>. Si no tienes acceso, pide a IT que te dé de alta.
+          </p>
+        </div>
+        <div class="muted" style="font-size: 12px" id="loginFoot">Kardex</div>
+      </div>
+      <div class="pane-r">
+        <div class="login-brand" style="color: #fff">
+          <div class="logo" style="background: #fff; color: var(--black)" id="loginLogo2"></div>
+          <div class="name" style="color: #fff">Kardex</div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 18px">
+          <div class="big">Lo que entra y sale,<br />con nombre y fecha.</div>
+          <div class="sub">
+            Registra entradas, salidas y ajustes de refacciones. El historial no se edita ni se
+            borra, así el stock del sistema cuadra con el físico.
+          </div>
+        </div>
+        <div class="tags" id="loginTags"></div>
+      </div>
+    </div>
+
+    <!-- ============ APP ============ -->
+    <div class="app hidden" id="app">
+      <aside class="side" id="side"></aside>
+      <main class="main">
+        <div class="topbar" id="topbar"></div>
+        <div class="view" id="view"></div>
+      </main>
+    </div>
+
+    <!-- ============ MODAL HOST ============ -->
+    <div class="scrim" id="scrim"><div id="modalHost"></div></div>
+
+    <!-- ============ TOASTS ============ -->
+    <div class="toasts" id="toasts"></div>
+
+    <script src="icons.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
