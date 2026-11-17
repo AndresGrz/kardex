@@ -10,18 +10,25 @@ Se borran al inicio y al final. Para borrar movimientos y bitácora se apagan
 los triggers DENTRO de una transacción (el DDL es transaccional en SQL
 Server), así nunca quedan apagados. Al terminar se verifica: 0 filas ZZTEST-,
 triggers habilitados y vw_chequeo_stock vacía.
+
+Tránsito: el endpoint de Infor siempre se simula (fixture `transito`) y está
+apagado por defecto. Las líneas de prueba usan DocNum ZZTEST-..., y la
+limpieza automática de asignaciones queda restringida a esas: una lista
+simulada nunca borra asignaciones reales de la BD de producción.
 """
 import secrets
 import uuid
 
 import bcrypt
 import pytest
+import requests
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 import config
 import db
 import infor
+import inventario
 import server
 
 PREFIJO = "ZZTEST-"
@@ -41,6 +48,11 @@ def _tabla(sql: str) -> str:
 def purgar() -> None:
     """Borra todo lo ZZTEST- en una sola transacción."""
     with db.engine().begin() as c:
+        # asignacion_transito no tiene trigger; va antes que items por la FK.
+        c.execute(text(
+            "DELETE FROM dbo.asignacion_transito WHERE doc_num LIKE 'ZZTEST-%' OR item_id IN "
+            "(SELECT id FROM dbo.items WHERE numero_parte LIKE 'ZZTEST-%')"
+        ))
         hay = c.execute(text("SELECT COUNT(*) FROM dbo.items WHERE numero_parte LIKE 'ZZTEST-%'")).scalar()
         if hay:
             for trg, tabla in TRIGGERS:
@@ -65,7 +77,11 @@ def verificar_limpio() -> None:
             "('tr_movimientos_inmutable', 'tr_bitacora_inmutable')"
         )).scalar()
         descuadres = c.execute(text("SELECT COUNT(*) FROM dbo.vw_chequeo_stock")).scalar()
+        asignaciones = c.execute(text(
+            "SELECT COUNT(*) FROM dbo.asignacion_transito WHERE doc_num LIKE 'ZZTEST-%'"
+        )).scalar()
     assert items == 0, f"quedaron {items} items ZZTEST-"
+    assert asignaciones == 0, f"quedaron {asignaciones} asignaciones de tránsito ZZTEST-"
     assert usuarios == 0, f"quedaron {usuarios} usuarios ZZTEST-"
     assert apagados == 0, "quedó un trigger de inmutabilidad deshabilitado"
     assert descuadres == 0, f"vw_chequeo_stock tiene {descuadres} filas"
@@ -120,10 +136,76 @@ def U():
 
 
 @pytest.fixture(autouse=True)
-def _infor_limpio():
+def _infor_limpio(monkeypatch):
+    """Cada prueba arranca con el cache vacío y el tránsito APAGADO (sin red)."""
+    monkeypatch.setattr(config, "INFOR_PO_PATH", "")
     infor.limpiar_cache()
     yield
     infor.limpiar_cache()
+
+
+@pytest.fixture(autouse=True)
+def _limpieza_solo_zztest(monkeypatch):
+    """La limpieza automática solo puede tocar asignaciones de prueba: las
+    pruebas corren contra la BD real y una lista simulada no trae las líneas
+    reales, así que sin esto borraría asignaciones de verdad."""
+    original = inventario._limpiar_asignaciones
+
+    def solo_pruebas(claves, consultado_en):
+        return original([k for k in claves if k[0].startswith(PREFIJO)], consultado_en)
+
+    monkeypatch.setattr(inventario, "_limpiar_asignaciones", solo_pruebas)
+
+
+class RespuestaFalsa:
+    def __init__(self, data, status=200):
+        self._data, self.status_code = data, status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code}")
+
+    def json(self):
+        return self._data
+
+
+def linea_oc(doc, linea, referencia, cantidad, entrega="30/11/40", creada="01/11/26", uom="EA"):
+    """Una línea como la regresa /infor/kardex_transit."""
+    return {
+        "DocNum": doc, "LineNum": linea, "Reference": referencia, "UoM": uom,
+        "PendingQty": float(cantidad), "CreateDate": creada, "ExpectedDeliveryDate": entrega,
+    }
+
+
+@pytest.fixture
+def transito(monkeypatch):
+    """Simula /infor/kardex_transit. transito(lineas) enciende el tránsito con
+    esas líneas; transito(None) lo deja caído. Limpia el cache en cada cambio.
+    transito.llamadas cuenta las consultas reales al endpoint desde el último
+    cambio (el alta de items también consulta el tránsito)."""
+    estado = {"lineas": [], "llamadas": 0}
+
+    def get(url, timeout):
+        estado["llamadas"] += 1
+        assert url == f"{config.API_BASE_URL}/infor/kardex_transit" and timeout == infor.TIMEOUT_S
+        if estado["lineas"] is None:
+            raise requests.ConnectionError("sin red")
+        return RespuestaFalsa(estado["lineas"])
+
+    monkeypatch.setattr(config, "INFOR_PO_PATH", "/infor/kardex_transit")
+    monkeypatch.setattr(infor.requests, "get", get)
+
+    class Control:
+        def __call__(self, lineas):
+            estado["lineas"] = lineas
+            estado["llamadas"] = 0
+            infor.limpiar_cache()
+
+        @property
+        def llamadas(self):
+            return estado["llamadas"]
+
+    return Control()
 
 
 @pytest.fixture

@@ -27,10 +27,13 @@ inventario.py  TODAS las reglas de negocio (permisos incluidos). Llamarlo direct
                aplica las mismas reglas que la API.
 auth.py        Login / JWT 8 h / roles / cambio de contraseña. AISLADO: cuando haya
                login centralizado, solo cambia este archivo.
-infor.py       Stock pendiente de Infor (OCs abiertas). AISLADO. Timeout 5 s, cache 5 min.
+infor.py       Trae y normaliza las líneas de OC en tránsito de Infor. AISLADO. Timeout 5 s,
+               cache 5 min. Qué item le toca a cada línea es regla de inventario.py.
 db.py          Engine, modelos SQLAlchemy, fechas UTC <-> Monterrey, verificar_esquema().
 config.py      Lectura y validación del .env (único lugar con nombres de variables).
 sql/01_crear_kardex.sql      FUENTE DE VERDAD del esquema + carga inicial. Se corre en SSMS.
+sql/02_transito.sql          Migración para la BD que ya existía: asignacion_transito + eventos
+                             de tránsito en la bitácora. Idempotente. (01 ya lo incluye.)
 sql/generar_carga_inicial.py Regenera el bloque de INSERT del SQL desde el Excel.
 frontend/      index.html, app.js (rutas por hash, sin framework), styles.css (sistema
                visual de Dossier + secciones KARDEX), icons.js.
@@ -52,8 +55,8 @@ deploy\run_server.bat                                                 # como en 
 
 `.env` lleva la contraseña `sa`: **no se sube a git**; `.env.example` documenta cada variable.
 `DB_URL` = el de Dossier cambiando `/dossier_local` por `/kardex`. `JWT_SECRET` obligatorio
-(sin él no arranca). `USUARIOS_TABLE=dossier_local.dbo.usuarios`. `INFOR_PO_PATH` vacío =
-pendiente apagado. `TZ_LOCAL=America/Monterrey`.
+(sin él no arranca). `USUARIOS_TABLE=dossier_local.dbo.usuarios`.
+`INFOR_PO_PATH=/infor/kardex_transit` (vacío = tránsito apagado). `TZ_LOCAL=America/Monterrey`.
 
 ## Modelo de datos (BD `kardex`)
 
@@ -63,8 +66,12 @@ existan tablas, vistas, triggers (habilitados) y la columna `rol_kardex`; si fal
 - `items`: catálogo. `stock_activo` es un **cache** de `SUM(movimientos.cantidad)`.
 - `movimientos`: **inmutable** (trigger `INSTEAD OF UPDATE, DELETE`). `cantidad` con signo:
   ENTRADA > 0, SALIDA < 0, AJUSTE ≠ 0. CHECKs de campos obligatorios por tipo.
-- `bitacora`: **inmutable**. Eventos `ALTA_ITEM | EDICION_ITEM | OBSOLETO | REVERTIR_OBSOLETO`;
-  una fila por campo editado; booleanos como "Sí"/"No". Columna `motivo` para obsoleto/revertir.
+- `bitacora`: **inmutable**. Eventos `ALTA_ITEM | EDICION_ITEM | OBSOLETO | REVERTIR_OBSOLETO |
+  ASIGNAR_TRANSITO | QUITAR_TRANSITO`; una fila por campo editado; booleanos como "Sí"/"No".
+  Columna `motivo` para obsoleto/revertir. Tránsito: `campo='transito'`, valor `PEX000977-10 · <referencia>`.
+- `asignacion_transito`: línea de OC (`doc_num` + `line_num`, PK: una línea, un item) → `item_id`,
+  asignada **a mano**. **No** es inmutable: la app borra las filas de líneas que ya no salen en el
+  endpoint. El rastro queda en la bitácora.
 - `vw_items_bajo_minimo`: la lee **Mercurio directo** para su correo (Kardex no envía correos ni
   expone nada para Mercurio).
 - `vw_chequeo_stock`: items con cache ≠ suma de movimientos. **Siempre debe estar vacía.**
@@ -77,8 +84,10 @@ existan tablas, vistas, triggers (habilitados) y la columna `rol_kardex`; si fal
 | Acción | Almacenista | Supervisor |
 | --- | --- | --- |
 | Buscar, ver kardex, entrada, salida, marcar obsoleto, cambiar su contraseña | sí | sí |
+| Ver el tránsito del item (tarjetas, solo lectura) | sí | sí |
 | Alta / edición de items, ajustes, revertir obsoleto, chequeo de stock | **403** | sí |
 | Autorizar salida sin pieza devuelta | **403** | sí |
+| Pestaña "Tránsito por asignar", asignar y quitar líneas | **403** | sí |
 
 - **Entrada**: entero > 0; OC y proveedor obligatorios; comentario opcional.
 - **Salida**: entero > 0, nunca mayor al stock; se cierra al momento. Departamento, nómina y
@@ -96,10 +105,20 @@ existan tablas, vistas, triggers (habilitados) y la columna `rol_kardex`; si fal
   atómico** (`inventario._mover_stock`): `UPDATE items SET stock_activo = stock_activo + :d OUTPUT
   inserted.stock_activo WHERE id = :id AND stock_activo + :d >= 0 [AND obsoleto = 0]`. Sin fila =
   stock insuficiente u obsoleto. Así dos almacenistas nunca sobregiran.
-- **Infor**: `infor.pendientes()` regresa `None` si está apagado o falla — **nunca asumir 0**; la UI
-  muestra "N/D". Si Infor responde y el item no aparece, su pendiente es 0. Los nombres de campo
-  están marcados `[CONFIRMAR con respuesta real]`. Los NP renombrados (`CFB-3/4`, ...) no van a
-  coincidir con Infor tal cual.
+- **Tránsito (Infor)**: `GET /infor/kardex_transit` → líneas `DocNum, LineNum, Reference, UoM,
+  PendingQty, CreateDate, ExpectedDeliveryDate` (fechas `dd/mm/yy`). `inventario._resolver_transito()`:
+  1. Primera palabra de `Reference` == `numero_parte` (sin mayúsculas/espacios) → **automática,
+     siempre gana**. Compras escribe el NP primero; si no empata, se corrige el NP en Kardex.
+  2. Si no, `DocNum + LineNum` en `asignacion_transito` → manual.
+  3. Si no, sin asignar: no suma a nadie y sale en la pestaña del supervisor.
+  "En tránsito" = suma de `PendingQty`. `infor.lineas()` regresa `None` si está apagado o falla —
+  **nunca asumir 0**; la UI muestra "N/D". No hay opción "No es de Kardex": si sobran líneas, se
+  filtra la consulta SQL del endpoint.
+- **Limpieza con candado**: cuando el endpoint responde con líneas, se borran las asignaciones
+  cuya línea ya no aparece **y** que se asignaron antes de esa consulta (con 2 workers, uno puede
+  tener un cache más viejo que la asignación del otro). Si falla o viene vacío, no se borra nada.
+  La limpieza no va a la bitácora; asignar/quitar a mano sí.
+- **Mercurio** lee `vw_items_bajo_minimo`; cómo obtendrá el tránsito está pendiente (no es de v1).
 
 ## Trampas de SQL Server (ya pasaron)
 
@@ -116,7 +135,9 @@ Corren contra la **BD real** (decisión del proyecto). Datos con prefijo `ZZTEST
 usuarios `ZZTEST-ALM`, `ZZTEST-SUP`, `ZZTEST-SIN` con `rol='export'` y contraseña aleatoria por
 corrida). Se borran al inicio y al final; para borrar movimientos/bitácora se deshabilitan los
 triggers **dentro de una transacción**. Al terminar se verifica: 0 filas `ZZTEST-`, triggers
-habilitados y `vw_chequeo_stock` vacía.
+habilitados y `vw_chequeo_stock` vacía. El endpoint de Infor **siempre se simula** (fixture
+`transito`; apagado por defecto) y la limpieza de asignaciones queda restringida a `DocNum`
+`ZZTEST-…`: una lista simulada nunca debe borrar asignaciones reales.
 
 ## Carga inicial
 
@@ -171,7 +192,8 @@ Servidor Windows `10.207.5.9`, PM2 → uvicorn en el **puerto 1003** con 2 worke
 | No carga `http://10.207.5.9:1003` | ¿`pm2 list` lo muestra online? ¿firewall 1003 abierto? |
 | Arranca y se cae | `pm2 logs kardex`: `.env` ausente, sin `JWT_SECRET`, o falta el esquema (mensaje claro) |
 | `/api/health` responde pero el login no | BD: `DB_URL`, columna `rol_kardex`, usuario con `rol_kardex` |
-| Pendiente siempre "N/D" | `INFOR_PO_PATH` vacío (apagado) o el API de OCs falla (ver log) |
+| En tránsito siempre "N/D" | `INFOR_PO_PATH` vacío (apagado) o `/infor/kardex_transit` falla (ver log) |
+| No arranca: "falta asignacion_transito" | Correr `sql/02_transito.sql` en SSMS |
 
 Logs de la app en `logs/kardex.log` (rotación 5 MB, 10 archivos). Con 2 workers ambos escriben
 el mismo archivo; si una rotación choca en Windows, loguru lo reporta en consola y sigue.

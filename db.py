@@ -130,6 +130,22 @@ class Bitacora(Base):
     fecha_hora: Mapped[datetime] = mapped_column(DATETIME2(0))
 
 
+class AsignacionTransito(Base):
+    """Línea de OC de Infor relacionada A MANO con un item (cuando la primera
+    palabra de Reference no empata con ningún número de parte). NO es
+    inmutable: se borra sola cuando la línea deja de salir en el endpoint
+    (se recibió o se canceló). El rastro queda en la bitácora del item."""
+
+    __tablename__ = "asignacion_transito"
+
+    doc_num: Mapped[str] = mapped_column(Unicode(30), primary_key=True)
+    line_num: Mapped[int] = mapped_column(Integer, primary_key=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("items.id"))
+    referencia: Mapped[str | None] = mapped_column(Unicode(500))
+    asignado_por: Mapped[str] = mapped_column(Unicode(50))
+    asignado_en: Mapped[datetime] = mapped_column(DATETIME2(0))
+
+
 # ============================================================
 # Verificación de esquema al arrancar
 # ============================================================
@@ -137,10 +153,13 @@ OBJETOS_REQUERIDOS = {
     "items": "U",
     "movimientos": "U",
     "bitacora": "U",
+    "asignacion_transito": "U",
     "vw_items_bajo_minimo": "V",
     "vw_chequeo_stock": "V",
 }
 TRIGGERS_REQUERIDOS = ("tr_movimientos_inmutable", "tr_bitacora_inmutable")
+# El CHECK de bitacora.evento debe aceptar los eventos de tránsito (sql/02_transito.sql).
+EVENTOS_REQUERIDOS = ("ASIGNAR_TRANSITO", "QUITAR_TRANSITO")
 
 
 def verificar_esquema() -> None:
@@ -155,12 +174,18 @@ def verificar_esquema() -> None:
             r.name: bool(r.is_disabled)
             for r in c.execute(text("SELECT name, is_disabled FROM sys.triggers"))
         }
+        check_evento = c.execute(text(
+            "SELECT definition FROM sys.check_constraints "
+            "WHERE name = 'CK_bitacora_evento' AND parent_object_id = OBJECT_ID('dbo.bitacora')"
+        )).scalar() or ""
     faltan = [n for n, t in OBJETOS_REQUERIDOS.items() if objetos.get(n) != t]
     faltan += [n for n in TRIGGERS_REQUERIDOS if n not in triggers]
+    faltan += [f"evento {e} en CK_bitacora_evento" for e in EVENTOS_REQUERIDOS if e not in check_evento]
     if faltan:
         raise RuntimeError(
             f"La BD no tiene el esquema de Kardex (faltan: {', '.join(faltan)}). "
-            "Corre sql/01_crear_kardex.sql en SSMS. La app no crea tablas."
+            "Corre en SSMS sql/01_crear_kardex.sql (BD nueva) o sql/02_transito.sql "
+            "(BD que ya existía). La app no crea tablas."
         )
     apagados = [n for n in TRIGGERS_REQUERIDOS if triggers[n]]
     if apagados:

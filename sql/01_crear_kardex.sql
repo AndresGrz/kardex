@@ -8,7 +8,7 @@
    Qué hace, en orden:
      0. Guarda: si la BD kardex ya tiene tablas, se detiene SIN borrar nada.
      1. Crea la BD kardex (si no existe).
-     2. Tablas items, movimientos y bitacora + índices.
+     2. Tablas items, movimientos, bitacora y asignacion_transito + índices.
      3. Triggers de inmutabilidad en movimientos y bitacora.
      4. Vistas vw_items_bajo_minimo (la lee Mercurio) y vw_chequeo_stock.
      5. Carga inicial del Excel "tools .xlsx" en UNA transacción, con
@@ -30,7 +30,7 @@ IF DB_ID(N'kardex') IS NOT NULL
 BEGIN
     DECLARE @n INT;
     EXEC sp_executesql
-        N'SELECT @n = COUNT(*) FROM kardex.sys.objects WHERE name IN (N''items'', N''movimientos'', N''bitacora'', N''vw_items_bajo_minimo'', N''vw_chequeo_stock'')',
+        N'SELECT @n = COUNT(*) FROM kardex.sys.objects WHERE name IN (N''items'', N''movimientos'', N''bitacora'', N''asignacion_transito'', N''vw_items_bajo_minimo'', N''vw_chequeo_stock'')',
         N'@n INT OUTPUT', @n = @n OUTPUT;
     IF @n > 0
     BEGIN
@@ -136,10 +136,29 @@ CREATE TABLE dbo.bitacora (
     motivo          NVARCHAR(500) NULL,      -- motivo opcional de OBSOLETO / REVERTIR_OBSOLETO
     usuario_nomina  NVARCHAR(50)  NOT NULL,
     fecha_hora      DATETIME2(0)  NOT NULL CONSTRAINT DF_bitacora_fecha DEFAULT (SYSUTCDATETIME()),
-    CONSTRAINT CK_bitacora_evento CHECK (evento IN (N'ALTA_ITEM', N'EDICION_ITEM', N'OBSOLETO', N'REVERTIR_OBSOLETO')),
+    CONSTRAINT CK_bitacora_evento CHECK (evento IN (N'ALTA_ITEM', N'EDICION_ITEM', N'OBSOLETO', N'REVERTIR_OBSOLETO',
+                                                    N'ASIGNAR_TRANSITO', N'QUITAR_TRANSITO')),
     CONSTRAINT CK_bitacora_campo  CHECK (evento <> N'EDICION_ITEM' OR campo IS NOT NULL)
 );
 CREATE INDEX IX_bitacora_item_fecha ON dbo.bitacora (item_id, fecha_hora);
+GO
+
+-- Líneas de OC de Infor relacionadas A MANO con un item (cuando la primera
+-- palabra de Reference no empata con ningún numero_parte). NO es inmutable:
+-- la app borra las filas de líneas que ya se recibieron o cancelaron; el
+-- rastro queda en la bitácora (ASIGNAR_TRANSITO / QUITAR_TRANSITO).
+-- En una BD creada antes de este cambio se agrega con sql/02_transito.sql.
+CREATE TABLE dbo.asignacion_transito (
+    doc_num       NVARCHAR(30)  NOT NULL,      -- DocNum de Infor, p. ej. PEX000977
+    line_num      INT           NOT NULL,      -- LineNum de Infor, p. ej. 10
+    item_id       INT           NOT NULL CONSTRAINT FK_asignacion_transito_items REFERENCES dbo.items (id),
+    referencia    NVARCHAR(500) NULL,          -- copia de Reference al asignar
+    asignado_por  NVARCHAR(50)  NOT NULL,      -- nómina del supervisor
+    asignado_en   DATETIME2(0)  NOT NULL CONSTRAINT DF_asignacion_transito_en DEFAULT (SYSUTCDATETIME()),  -- UTC
+    CONSTRAINT PK_asignacion_transito PRIMARY KEY (doc_num, line_num),  -- una línea, un item
+    CONSTRAINT CK_asignacion_transito_doc CHECK (LEN(doc_num) > 0)
+);
+CREATE INDEX IX_asignacion_transito_item ON dbo.asignacion_transito (item_id);
 GO
 
 /* ---------- 3. Inmutabilidad ----------

@@ -169,6 +169,15 @@ class AjusteIn(_Cuerpo):
     motivo: str | None = None
 
 
+class LineaTransitoIn(_Cuerpo):
+    doc_num: str | None = None
+    line_num: int | None = None
+
+
+class AsignarTransitoIn(LineaTransitoIn):
+    item_id: int | None = None
+
+
 # ============================================================
 # Rutas
 # ============================================================
@@ -257,6 +266,21 @@ def ajuste(body: AjusteIn, u: dict = Usuario):
 @api.get("/chequeo-stock")
 def chequeo_stock(u: dict = Usuario):
     return inventario.chequeo_stock(u)
+
+
+@api.get("/transito/por-asignar")
+def transito_por_asignar(u: dict = Usuario):
+    return inventario.transito_por_asignar(u)
+
+
+@api.post("/transito/asignar", status_code=201)
+def asignar_transito(body: AsignarTransitoIn, u: dict = Usuario):
+    return inventario.asignar_transito(body.doc_num, body.line_num, body.item_id, u)
+
+
+@api.post("/transito/quitar")
+def quitar_transito(body: LineaTransitoIn, u: dict = Usuario):
+    return inventario.quitar_transito(body.doc_num, body.line_num, u)
 
 
 app.include_router(api)

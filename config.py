@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 
 def _env(nombre: str, default: str = "") -> str:
@@ -25,7 +25,7 @@ API_BASE_URL = _env("API_BASE_URL", "http://10.207.5.9:1303").rstrip("/")
 EMAIL_API_URL = _env("EMAIL_API_URL", "http://10.207.5.9:1999").rstrip("/")  # sin uso en v1
 JWT_SECRET = _env("JWT_SECRET")
 USUARIOS_TABLE = _env("USUARIOS_TABLE", "dossier_local.dbo.usuarios")
-INFOR_PO_PATH = _env("INFOR_PO_PATH")  # vacío = pendiente de Infor apagado
+INFOR_PO_PATH = _env("INFOR_PO_PATH")  # p. ej. /infor/kardex_transit; vacío = tránsito apagado
 TZ_LOCAL = _env("TZ_LOCAL", "America/Monterrey")
 
 LOG_DIR = os.path.join(BASE_DIR, "logs")

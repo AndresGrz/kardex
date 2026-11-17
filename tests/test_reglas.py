@@ -10,7 +10,7 @@ import config
 import db
 import infor
 import inventario
-from conftest import stock_de
+from conftest import RespuestaFalsa, linea_oc, stock_de
 
 
 def salida(client, H, rol, item_id, cantidad=1, **kw):
@@ -380,69 +380,202 @@ def test_chequeo_stock(client, H):
 
 
 # ============================================================
-# Infor (stock pendiente)
+# Tránsito (líneas de OC abiertas en Infor)
 # ============================================================
-def test_infor_apagado(client, H, nuevo_item, monkeypatch):
+def _transito_de(client, H, item_id, rol="alm"):
+    k = client.get(f"/api/items/{item_id}", headers=H[rol]).json()
+    return k["item"]["en_transito"], k["transito"], k["transito_disponible"]
+
+
+def _por_asignar(client, H):
+    r = client.get("/api/transito/por-asignar", headers=H["sup"])
+    assert r.status_code == 200, r.text
+    res = r.json()
+    return res["disponible"], [(l["doc_num"], l["line_num"]) for l in res["lineas"] if l["doc_num"].startswith("ZZTEST-")]
+
+
+def _asignar(client, H, doc, linea, item_id, rol="sup"):
+    return client.post("/api/transito/asignar", json={"doc_num": doc, "line_num": linea, "item_id": item_id}, headers=H[rol])
+
+
+def _quitar(client, H, doc, linea, rol="sup"):
+    return client.post("/api/transito/quitar", json={"doc_num": doc, "line_num": linea}, headers=H[rol])
+
+
+def _asignaciones(doc):
+    with db.engine().connect() as c:
+        return c.execute(
+            text("SELECT line_num FROM dbo.asignacion_transito WHERE doc_num = :d ORDER BY line_num"), {"d": doc}
+        ).scalars().all()
+
+
+def test_infor_normaliza_lineas():
+    lineas = infor.normalizar([
+        linea_oc("PEX1", 10, "ST-5-163-095\xa0  BROCA  RECTA", "12.0", entrega="20/11/26", creada="20/10/26"),
+        linea_oc("PEX1", 20, "  lub00025     FINWORKS", 4, entrega="fecha rara"),
+        {"DocNum": "PEX2", "LineNum": 30, "Reference": None, "PendingQty": 1},
+    ])
+    a, b, c = lineas
+    assert (a["doc_num"], a["line_num"], a["codigo"], a["cantidad"]) == ("PEX1", 10, "ST-5-163-095", 12)
+    assert a["referencia"] == "ST-5-163-095 BROCA RECTA"
+    assert (a["entrega"].isoformat(), a["creada"].isoformat()) == ("2026-11-20", "2026-10-20")
+    assert b["codigo"] == "LUB00025" and b["entrega"] is None  # fecha rara no tumba la línea
+    assert c["codigo"] == "" and c["referencia"] == "" and c["uom"] == ""
+    for malo in ({"x": 1}, [{"DocNum": "PEX3", "PendingQty": 1}], [{"DocNum": "PEX3", "LineNum": 1, "PendingQty": "n/a"}]):
+        with pytest.raises(ValueError):
+            infor.normalizar(malo)
+
+
+def test_transito_apagado(client, H, nuevo_item):
     it = nuevo_item()
-    monkeypatch.setattr(config, "INFOR_PO_PATH", "")
     res = client.get("/api/items", params={"q": it["numero_parte"]}, headers=H["alm"]).json()
-    assert res["pendiente_disponible"] is False
-    assert res["items"][0]["pendiente"] is None
-    k = client.get(f"/api/items/{it['id']}", headers=H["alm"]).json()
-    assert k["pendiente_disponible"] is False and k["item"]["pendiente"] is None
+    assert res["transito_disponible"] is False and res["items"][0]["en_transito"] is None
+    assert _transito_de(client, H, it["id"]) == (None, [], False)
+    assert _por_asignar(client, H) == (False, [])
 
 
-def test_infor_caido(client, H, nuevo_item, monkeypatch):
+def test_transito_caido_es_no_disponible(client, H, nuevo_item, transito):
     it = nuevo_item()
-    monkeypatch.setattr(config, "INFOR_PO_PATH", "/infor/activePurchaseOrders")
-
-    def caido(*a, **kw):
-        raise requests.ConnectionError("sin red")
-
-    monkeypatch.setattr(infor.requests, "get", caido)
+    transito(None)
     res = client.get("/api/items", params={"q": it["numero_parte"]}, headers=H["alm"]).json()
-    assert res["pendiente_disponible"] is False and res["items"][0]["pendiente"] is None
+    assert res["transito_disponible"] is False and res["items"][0]["en_transito"] is None  # nunca 0
 
 
-class _Resp:
-    def __init__(self, data, status=200):
-        self._data, self.status_code = data, status
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise requests.HTTPError(f"{self.status_code}")
-
-    def json(self):
-        return self._data
+def test_transito_404_es_no_disponible(monkeypatch):
+    monkeypatch.setattr(config, "INFOR_PO_PATH", "/infor/kardex_transit")
+    monkeypatch.setattr(infor.requests, "get", lambda *a, **kw: RespuestaFalsa({"detail": "Not Found"}, 404))
+    assert infor.lineas() is None
 
 
-def test_infor_404_es_no_disponible(monkeypatch):
-    monkeypatch.setattr(config, "INFOR_PO_PATH", "/infor/activePurchaseOrders")
-    monkeypatch.setattr(infor.requests, "get", lambda *a, **kw: _Resp({"detail": "Not Found"}, 404))
-    assert infor.pendientes() is None
-
-
-def test_infor_mapeo_suma_lineas(client, H, nuevo_item, monkeypatch):
-    con_oc = nuevo_item()
-    sin_oc = nuevo_item()
-    lineas = [
-        {infor.CAMPO_NUMERO_PARTE: con_oc["numero_parte"].lower(), infor.CAMPO_CANTIDAD_ABIERTA: 3},
-        {infor.CAMPO_NUMERO_PARTE: con_oc["numero_parte"], infor.CAMPO_CANTIDAD_ABIERTA: "4.000"},
-        {infor.CAMPO_NUMERO_PARTE: "OTRO-NP", infor.CAMPO_CANTIDAD_ABIERTA: 9},
-    ]
-    assert infor.mapear(lineas) == {con_oc["numero_parte"]: 7, "OTRO-NP": 9}
-    monkeypatch.setattr(config, "INFOR_PO_PATH", "/infor/activePurchaseOrders")
-    llamadas = []
-
-    def get(url, timeout):
-        llamadas.append((url, timeout))
-        return _Resp(lineas)
-
-    monkeypatch.setattr(infor.requests, "get", get)
+def test_transito_match_automatico_suma_lineas(client, H, nuevo_item, transito):
+    con = nuevo_item()
+    sin = nuevo_item()
+    np = con["numero_parte"]
+    transito([
+        linea_oc("ZZTEST-PEX1", 10, f"{np.lower()}   Descripción de compras", 3, entrega="01/01/20"),
+        linea_oc("ZZTEST-PEX2", 20, f"{np}\xa0 otra línea", "4.000"),
+        linea_oc("ZZTEST-PEX2", 30, "OTRO-CODIGO no es de Kardex", 9),
+    ])
     res = client.get("/api/items", params={"q": "ZZTEST-"}, headers=H["alm"]).json()
-    pend = {x["id"]: x["pendiente"] for x in res["items"]}
-    assert res["pendiente_disponible"] is True
-    assert pend[con_oc["id"]] == 7
-    assert pend[sin_oc["id"]] == 0  # Infor respondió y el item no aparece -> 0
-    client.get("/api/items", params={"q": "ZZTEST-"}, headers=H["alm"])
-    assert llamadas == [(f"{config.API_BASE_URL}/infor/activePurchaseOrders", infor.TIMEOUT_S)]  # cache 5 min
+    tr = {x["id"]: x["en_transito"] for x in res["items"]}
+    assert res["transito_disponible"] is True
+    assert tr[con["id"]] == 7
+    assert tr[sin["id"]] == 0  # Infor respondió y ninguna línea es suya -> 0
+    total, lineas, disp = _transito_de(client, H, con["id"])
+    assert disp is True and total == 7
+    # primero la entrega más próxima; la del 2020 está vencida
+    assert [(l["doc_num"], l["line_num"], l["origen"], l["vencida"]) for l in lineas] == [
+        ("ZZTEST-PEX1", 10, "auto", True), ("ZZTEST-PEX2", 20, "auto", False),
+    ]
+    assert lineas[0]["entrega"] == "01/01/2020" and lineas[0]["uom"] == "EA"
+    # la que no empata queda por asignar; las automáticas no
+    assert _por_asignar(client, H) == (True, [("ZZTEST-PEX2", 30)])
+    # cache de 5 min: varias pantallas, una sola consulta a Infor
+    assert transito.llamadas == 1
+
+
+def test_asignar_y_quitar_transito(client, H, nuevo_item, transito):
+    it = nuevo_item()
+    transito([linea_oc("ZZTEST-PEX3", 10, "FOO123 Broca recta 3.30 mm", 12)])
+    assert _por_asignar(client, H) == (True, [("ZZTEST-PEX3", 10)])
+
+    # el almacenista ve, pero no asigna ni quita (403 de la API)
+    assert client.get("/api/transito/por-asignar", headers=H["alm"]).status_code == 403
+    assert _asignar(client, H, "ZZTEST-PEX3", 10, it["id"], rol="alm").status_code == 403
+    assert _asignaciones("ZZTEST-PEX3") == []
+
+    r = _asignar(client, H, "ZZTEST-PEX3", 10, it["id"])
+    assert r.status_code == 201, r.text
+    assert (r.json()["origen"], r.json()["asignado_por"]) == ("manual", "ZZTEST-SUP")
+    total, lineas, _ = _transito_de(client, H, it["id"])
+    assert total == 12 and [(l["origen"], l["asignado_por"]) for l in lineas] == [("manual", "ZZTEST-SUP")]
+    assert _por_asignar(client, H) == (True, [])
+    # una línea, un item
+    assert _asignar(client, H, "ZZTEST-PEX3", 10, it["id"]).status_code == 409
+
+    assert _quitar(client, H, "ZZTEST-PEX3", 10, rol="alm").status_code == 403
+    assert _quitar(client, H, "ZZTEST-PEX3", 10).status_code == 200
+    assert _transito_de(client, H, it["id"])[0] == 0
+    assert _por_asignar(client, H) == (True, [("ZZTEST-PEX3", 10)])
+    assert _quitar(client, H, "ZZTEST-PEX3", 10).status_code == 404
+
+    # la bitácora guarda las dos acciones manuales
+    k = client.get(f"/api/items/{it['id']}", headers=H["alm"]).json()
+    eventos = [(b["evento"], b["valor_anterior"], b["valor_nuevo"], b["usuario_nomina"]) for b in k["bitacora"]]
+    assert eventos[:2] == [
+        ("QUITAR_TRANSITO", "ZZTEST-PEX3-10 · FOO123 Broca recta 3.30 mm", None, "ZZTEST-SUP"),
+        ("ASIGNAR_TRANSITO", None, "ZZTEST-PEX3-10 · FOO123 Broca recta 3.30 mm", "ZZTEST-SUP"),
+    ]
+
+
+def test_asignar_transito_reglas(client, H, nuevo_item, transito):
+    it = nuevo_item()
+    obsoleto = nuevo_item()
+    assert client.post(f"/api/items/{obsoleto['id']}/obsoleto", json={}, headers=H["sup"]).status_code == 200
+    transito([
+        linea_oc("ZZTEST-PEX4", 10, f"{it['numero_parte']} empata sola", 2),
+        linea_oc("ZZTEST-PEX4", 20, "SINCODIGO", 5),
+    ])
+    r = _asignar(client, H, "ZZTEST-PEX4", 10, obsoleto["id"])
+    assert r.status_code == 409 and "automáticamente" in r.json()["detail"]
+    assert _asignar(client, H, "ZZTEST-PEX4", 99, it["id"]).status_code == 404  # ya no está abierta
+    r = _asignar(client, H, "ZZTEST-PEX4", 20, obsoleto["id"])
+    assert r.status_code == 409 and "obsoleto" in r.json()["detail"]
+    assert _asignar(client, H, "ZZTEST-PEX4", 20, 999999999).status_code == 404
+    assert _asignar(client, H, "", 20, it["id"]).status_code == 400
+    assert _asignar(client, H, "ZZTEST-PEX4", None, it["id"]).status_code == 400
+    assert _asignaciones("ZZTEST-PEX4") == []
+    transito(None)  # Infor caído: no se asigna a ciegas
+    assert _asignar(client, H, "ZZTEST-PEX4", 20, it["id"]).status_code == 409
+
+
+def test_automatico_gana_sobre_manual(client, H, nuevo_item, transito):
+    manual = nuevo_item()
+    codigo = f"ZZTEST-COD{manual['id']}"
+    transito([linea_oc("ZZTEST-PEX5", 10, f"{codigo} pieza", 6)])
+    assert _asignar(client, H, "ZZTEST-PEX5", 10, manual["id"]).status_code == 201
+    assert _transito_de(client, H, manual["id"])[0] == 6
+    # después dan de alta (o renombran) un item con el código exacto: gana el automático
+    auto = nuevo_item(numero_parte=codigo)
+    assert _transito_de(client, H, auto["id"])[0] == 6
+    assert _transito_de(client, H, manual["id"])[0] == 0
+    # la asignación vieja se ignora (no se borra mientras la línea siga abierta)
+    assert _asignaciones("ZZTEST-PEX5") == [10]
+
+
+def test_limpieza_de_asignaciones_con_candado(client, H, nuevo_item, transito):
+    it = nuevo_item()
+    a, b, reciente = (linea_oc("ZZTEST-PEX6", n, f"SINCODIGO{n}", 1) for n in (10, 20, 30))
+    transito([a, b, reciente])
+    for n in (10, 20, 30):
+        assert _asignar(client, H, "ZZTEST-PEX6", n, it["id"]).status_code == 201
+    with db.engine().begin() as c:
+        # 10 y 20: asignadas hace una hora. 30: "después" de la próxima consulta
+        # (como si la hubiera asignado otro worker que tiene un cache más nuevo).
+        c.execute(text(
+            "UPDATE dbo.asignacion_transito SET asignado_en = DATEADD(HOUR, -1, asignado_en) "
+            "WHERE doc_num = 'ZZTEST-PEX6' AND line_num IN (10, 20)"
+        ))
+        c.execute(text(
+            "UPDATE dbo.asignacion_transito SET asignado_en = DATEADD(HOUR, 1, asignado_en) "
+            "WHERE doc_num = 'ZZTEST-PEX6' AND line_num = 30"
+        ))
+
+    transito(None)  # Infor caído: no se borra nada
+    client.get("/api/items", headers=H["alm"])
+    assert _asignaciones("ZZTEST-PEX6") == [10, 20, 30]
+
+    transito([])  # respuesta vacía: candado, no se borra nada
+    client.get("/api/items", headers=H["alm"])
+    assert _asignaciones("ZZTEST-PEX6") == [10, 20, 30]
+
+    # la 10 se recibió: se borra. La 30 también falta, pero se asignó después
+    # de la consulta: se respeta hasta la siguiente.
+    transito([b, linea_oc("ZZTEST-PEX7", 10, "SINCODIGO", 1)])
+    total, lineas, _ = _transito_de(client, H, it["id"])
+    assert _asignaciones("ZZTEST-PEX6") == [20, 30]
+    assert total == 1 and [l["line_num"] for l in lineas] == [20]
+    # la limpieza automática no deja rastro en la bitácora (solo las acciones manuales)
+    k = client.get(f"/api/items/{it['id']}", headers=H["alm"]).json()
+    assert [x["evento"] for x in k["bitacora"]].count("QUITAR_TRANSITO") == 0
+

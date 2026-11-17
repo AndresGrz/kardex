@@ -4,7 +4,7 @@
      #/buscar            inventario (búsqueda)
      #/item/<id>         kardex del item (movimientos + bitácora)
      #/entrada[?item=]   #/salida[?item=]   #/ajuste[?item=]  (capturas)
-     #/nuevo  #/chequeo  (solo supervisor)
+     #/nuevo  #/chequeo  #/transito  (solo supervisor)
    Todo texto que viene del servidor pasa por esc() antes de entrar al HTML.
    La UI oculta lo que el rol no puede hacer, pero quien decide es la API (403).
    ============================================================ */
@@ -60,9 +60,11 @@ const state = {
   version: '',
   route: { name: 'buscar', id: null, query: {} },
   // Buscar
-  q: '', obsoletos: false, filtro: 'todos', items: [], pendDisp: true, sel: 0,
+  q: '', obsoletos: false, filtro: 'todos', items: [], transDisp: true, sel: 0,
   // Kardex del item
   kx: null, kxTab: 'mov',
+  // Tránsito por asignar (supervisor): líneas sin item y catálogo para el selector
+  tr: null, trItems: [],
   // Capturas hechas en esta sesión del navegador (solo para mostrar)
   sesion: [],
 };
@@ -111,12 +113,33 @@ const EVENTO = {
   EDICION_ITEM: ['', 'edit', 'Edición'],
   OBSOLETO: ['danger', 'archive', 'Obsoleto'],
   REVERTIR_OBSOLETO: ['ok', 'undo', 'Reactivado'],
+  ASIGNAR_TRANSITO: ['info', 'truck', 'Tránsito asignado'],
+  QUITAR_TRANSITO: ['', 'truck', 'Tránsito quitado'],
 };
 const CAMPOS = {
   numero_parte: 'Número de parte', descripcion: 'Descripción', marca_modelo_uso: 'Marca/modelo/uso',
   unidad_medida: 'Unidad', inventario_minimo: 'Mínimo', inventario_maximo: 'Máximo',
   requiere_cambio: 'Requiere cambio', obsoleto: 'Obsoleto',
 };
+
+/* Tarjeta de una línea de OC en tránsito (kardex del item y pestaña Tránsito).
+   foot: HTML de la parte de abajo (origen de la asignación o botones). */
+function tarjetaTransito(l, foot = '') {
+  return `
+    <div class="tr-card ${l.vencida ? 'late' : ''}">
+      <div class="tr-top">
+        <span class="tr-doc">${esc(l.doc_num)} <span class="muted">· línea ${esc(l.line_num)}</span></span>
+        <span class="tr-qty">${fmt(l.cantidad)} <small>${esc(l.uom)}</small></span>
+      </div>
+      <div class="tr-ref">${l.referencia ? esc(l.referencia) : '<span class="muted">Sin referencia en Infor</span>'}</div>
+      <div class="tr-dates">
+        <span>Creada ${esc(l.creada || '—')} · Entrega esperada <b>${esc(l.entrega || '—')}</b></span>
+        ${l.vencida ? `<span class="chip warn sm">${I('clock')}Vencida</span>` : ''}
+      </div>
+      ${foot ? `<div class="tr-foot">${foot}</div>` : ''}
+    </div>`;
+}
+const claveLinea = (l) => `${l.doc_num}-${l.line_num}`;
 
 /* ---------- sonidos de toast (igual que Dossier) ---------- */
 let _audioCtx = null;
@@ -377,6 +400,7 @@ const ROUTES = {
   ajuste: { nav: 'ajuste', sup: true, title: 'Ajuste de inventario', sub: 'Corrige el stock contra el conteo físico', mount: mountAjuste },
   nuevo: { nav: 'nuevo', sup: true, title: 'Nuevo item', sub: 'Alta de un número de parte en el catálogo', mount: mountNuevo },
   chequeo: { nav: 'chequeo', sup: true, title: 'Chequeo de stock', sub: 'Stock activo contra la suma de sus movimientos', mount: mountChequeo },
+  transito: { nav: 'transito', sup: true, title: 'Tránsito por asignar', sub: 'Líneas de OC de Infor que no empatan solas con un número de parte', mount: mountTransito },
 };
 
 function parseHash() {
@@ -434,6 +458,7 @@ function renderSide() {
       <nav class="nav">
         ${item('ajuste', 'sliders', 'Ajuste')}
         ${item('nuevo', 'plus', 'Nuevo item')}
+        ${item('transito', 'truck', 'Tránsito')}
         ${item('chequeo', 'shield', 'Chequeo de stock')}
       </nav>` : ''}
     <div class="grow"></div>
@@ -509,7 +534,7 @@ async function cargarItems() {
   const res = await call('GET', `/items?${qs}`);
   if (!res || seq !== _buscarSeq || state.route.name !== 'buscar') return;
   state.items = res.items;
-  state.pendDisp = res.pendiente_disponible;
+  state.transDisp = res.transito_disponible;
   state.sel = 0;
   renderBuscar();
 }
@@ -540,7 +565,7 @@ function renderBuscar() {
       <div class="stat"><div class="k">Unidades en stock</div><div class="v">${fmt(unidades)}</div><div class="d">suma de activos</div></div>
     </div>
 
-    ${state.pendDisp ? '' : `<div class="banner lock" style="margin-bottom:14px;">${I('info')}<span><b>Pendiente de Infor no disponible.</b> La columna Pendiente muestra N/D hasta que el API de órdenes de compra responda.</span></div>`}
+    ${state.transDisp ? '' : `<div class="banner lock" style="margin-bottom:14px;">${I('info')}<span><b>Tránsito de Infor no disponible.</b> La columna En tránsito muestra N/D hasta que el API de órdenes de compra responda.</span></div>`}
 
     <div class="card">
       <div class="card-h">
@@ -555,7 +580,7 @@ function renderBuscar() {
         <table class="tbl" id="tblItems">
           <thead><tr>
             <th>Número de parte</th><th>Descripción</th><th>Uso / medida</th>
-            <th class="r">Activo</th><th class="r">Pendiente</th><th class="r">Mín.</th><th class="r">Máx.</th><th>Etiquetas</th>
+            <th class="r">Activo</th><th class="r">En tránsito</th><th class="r">Mín.</th><th class="r">Máx.</th><th>Etiquetas</th>
           </tr></thead>
           <tbody>
             ${rows.map((it, i) => `
@@ -564,7 +589,7 @@ function renderBuscar() {
               <td>${esc(it.descripcion)}</td>
               <td class="muted">${it.marca_modelo_uso ? esc(it.marca_modelo_uso) : '—'}</td>
               <td class="num r" title="${esc(it.unidad_medida)}"><b>${fmt(it.stock_activo)}</b></td>
-              <td class="num r">${it.pendiente === null ? '<span class="nd">N/D</span>' : fmt(it.pendiente)}</td>
+              <td class="num r">${it.en_transito === null ? '<span class="nd">N/D</span>' : fmt(it.en_transito)}</td>
               <td class="num r">${fmt(it.inventario_minimo)}</td>
               <td class="num r">${fmt(it.inventario_maximo)}</td>
               <td><div class="chips">${itemChips(it)}</div></td>
@@ -607,9 +632,9 @@ async function recargarItem() {
 }
 
 function renderItem() {
-  const { item: it, movimientos: movs, bitacora: bits, pendiente_disponible } = state.kx;
+  const { item: it, movimientos: movs, bitacora: bits, transito, transito_disponible } = state.kx;
   const sup = esSup();
-  const pend = it.pendiente;
+  const trans = it.en_transito;
 
   $('#view').innerHTML = `
   <div class="row" style="margin-bottom:14px;gap:12px;flex-wrap:wrap;">
@@ -624,7 +649,7 @@ function renderItem() {
     <div class="col" style="gap:14px;min-width:0;">
       <div class="stat-row">
         <div class="stat ${it.bajo_minimo ? 'warn' : ''}"><div class="k">Activo</div><div class="v">${fmt(it.stock_activo)} <small>${esc(it.unidad_medida)}</small></div><div class="d">${it.bajo_minimo ? 'bajo su mínimo' : 'en almacén'}</div></div>
-        <div class="stat"><div class="k">Pendiente</div><div class="v ${pend === null ? 'nd' : ''}">${pend === null ? 'N/D' : fmt(pend)}</div><div class="d">${pendiente_disponible ? 'en OC abiertas (Infor)' : 'pendiente no disponible'}</div></div>
+        <div class="stat"><div class="k">En tránsito</div><div class="v ${trans === null ? 'nd' : ''}">${trans === null ? 'N/D' : fmt(trans)}</div><div class="d">${transito_disponible ? 'en OC abiertas (Infor)' : 'tránsito no disponible'}</div></div>
         <div class="stat"><div class="k">Mínimo</div><div class="v">${fmt(it.inventario_minimo)}</div><div class="d">${it.inventario_minimo > 0 ? 'alerta de mínimos' : 'sin alerta'}</div></div>
         <div class="stat"><div class="k">Máximo</div><div class="v">${fmt(it.inventario_maximo)}</div><div class="d">${it.inventario_maximo === null ? 'sin máximo' : 'tope de stock'}</div></div>
       </div>
@@ -646,6 +671,8 @@ function renderItem() {
           </div>
         </div>
       </div>
+
+      ${seccionTransito(transito, transito_disponible, sup)}
 
       <div class="card">
         <div class="card-h">
@@ -700,6 +727,46 @@ function renderItem() {
   if (br) br.onclick = abrirReactivar;
   const be = $('#btnEditar');
   if (be) be.onclick = abrirEditar;
+  $$('[data-quitar]').forEach((b) => (b.onclick = () => quitarTransito(transito[Number(b.dataset.quitar)])));
+}
+
+/* ---------- tránsito del item (tarjetas) ---------- */
+function seccionTransito(lineas, disponible, sup) {
+  const total = lineas.reduce((a, l) => a + l.cantidad, 0);
+  let body;
+  if (!disponible) {
+    body = `<div class="banner lock">${I('wifiOff')}<span><b>Tránsito no disponible.</b> No se pudo consultar Infor; se muestra N/D hasta que responda.</span></div>`;
+  } else if (!lineas.length) {
+    body = `<div class="empty" style="padding:22px 12px;"><div class="ic">${I('truck')}</div><b>Sin líneas en tránsito</b>
+      ${sup ? 'Si falta una OC, asígnala desde <a href="#/transito">Tránsito</a>.' : 'Ninguna OC abierta de Infor es de este item.'}</div>`;
+  } else {
+    body = `<div class="tr-grid">${lineas.map((l, i) => tarjetaTransito(l, l.origen === 'auto'
+      ? `<span class="chip info sm">${I('spark')}Automática</span><span class="muted">El código de la referencia es el número de parte</span>`
+      : `<span class="chip sm">${I('user')}Asignada · ${esc(l.asignado_por)}</span><span class="muted">${esc(l.asignado_en || '')}</span>
+         ${sup ? `<button class="btn sm danger tr-act" data-quitar="${i}">${I('x')} Quitar</button>` : ''}`)).join('')}</div>`;
+  }
+  return `
+    <div class="card">
+      <div class="card-h"><h3>${I('truck')} En tránsito</h3>
+        <span class="sub">${disponible && lineas.length ? `${lineas.length} línea(s) · ${fmt(total)} en total` : 'OC abiertas en Infor'}</span>
+        ${sup ? `<div class="right"><button class="btn sm ghost" data-go="#/transito">${I('list')} Por asignar</button></div>` : ''}</div>
+      <div class="card-b">${body}</div>
+    </div>`;
+}
+
+async function quitarTransito(l) {
+  const ok = await confirmar({
+    title: `${I('truck')} Quitar asignación`,
+    sub: `<span class="mono">${esc(claveLinea(l))}</span> · ${fmt(l.cantidad)} ${esc(l.uom)}`,
+    body: `${tarjetaTransito(l)}
+      <p class="muted" style="font-size:12.5px;margin:12px 0 0;">La línea deja de sumar al tránsito de este item y regresa a <b>Tránsito por asignar</b>. Queda en la bitácora.</p>`,
+    ok: 'Quitar asignación', okClass: 'danger', icon: 'x',
+  });
+  if (!ok) return;
+  const res = await call('POST', '/transito/quitar', { doc_num: l.doc_num, line_num: l.line_num });
+  if (!res) return;
+  toast('ok', 'Asignación quitada', `${claveLinea(l)} ya no suma al tránsito de ${state.kx.item.numero_parte}.`);
+  await recargarItem();
 }
 
 function detalleMovimiento(m) {
@@ -748,6 +815,8 @@ function tablaBitacora(bits) {
     if (b.evento === 'ALTA_ITEM') return `Alta de <span class="mono">${esc(b.valor_nuevo)}</span>`;
     if (b.evento === 'OBSOLETO') return 'Marcado como obsoleto';
     if (b.evento === 'REVERTIR_OBSOLETO') return 'Se revirtió el obsoleto';
+    if (b.evento === 'ASIGNAR_TRANSITO') return `Línea en tránsito asignada: <span class="mono">${esc(b.valor_nuevo)}</span>`;
+    if (b.evento === 'QUITAR_TRANSITO') return `Se quitó la línea en tránsito: <span class="mono">${esc(b.valor_anterior)}</span>`;
     const v = (x) => (x === null || x === undefined ? '<span class="muted">—</span>' : `<b>${esc(x)}</b>`);
     return `${esc(CAMPOS[b.campo] || b.campo)}: ${v(b.valor_anterior)} <span class="muted">→</span> ${v(b.valor_nuevo)}`;
   };
@@ -1420,6 +1489,92 @@ async function mountChequeo() {
       </div>
     </div>`;
   $('#btnRevisar').onclick = () => mountChequeo();
+}
+
+/* ============================================================
+   TRÁNSITO POR ASIGNAR (solo supervisor)
+   Líneas de OC abiertas en Infor cuya primera palabra de la referencia no
+   es ningún número de parte de Kardex. El supervisor las relaciona a mano.
+   ============================================================ */
+async function mountTransito() {
+  $('#view').innerHTML = `<div class="loading">Consultando Infor…</div>`;
+  const [res, cat] = await Promise.all([
+    call('GET', '/transito/por-asignar'),
+    call('GET', '/items?obsoletos=false'), // nunca se asigna a un obsoleto
+  ]);
+  if (!res || !cat || state.route.name !== 'transito') return;
+  state.tr = res;
+  state.trItems = cat.items;
+  renderTransito();
+}
+
+function renderTransito() {
+  const { disponible, lineas } = state.tr;
+  let body;
+  if (!disponible) {
+    body = `<div class="banner lock">${I('wifiOff')}<span><b>Tránsito de Infor no disponible.</b> No se pudo consultar el API de órdenes de compra. Intenta de nuevo en unos minutos.</span></div>`;
+  } else if (!lineas.length) {
+    body = `<div class="empty"><div class="ic">${I('checkCircle')}</div><b>Nada por asignar</b>Todas las líneas abiertas de Infor ya tienen item.</div>`;
+  } else {
+    body = `<div class="tr-grid">${lineas.map((l, i) => tarjetaTransito(l,
+      `<span class="muted">Código <span class="mono">${l.codigo ? esc(l.codigo) : '—'}</span> no es un número de parte</span>
+       <button class="btn sm primary tr-act" data-asignar="${i}">${I('box')} Asignar a un item</button>`)).join('')}</div>`;
+  }
+  $('#view').innerHTML = `
+    <div class="banner info" style="margin-bottom:14px;">${I('info')}<span>
+      Una línea de OC se relaciona <b>sola</b> cuando la primera palabra de su referencia es el número de parte en Kardex.
+      Aquí salen las que no empataron. Al asignarla, suma al <b>En tránsito</b> del item hasta que se recibe en Infor.</span></div>
+    <div class="card">
+      <div class="card-h"><h3>${I('truck')} Líneas sin item</h3>
+        <span class="sub">${disponible ? `${lineas.length} línea(s)` : 'N/D'}</span>
+        <div class="right"><button class="btn sm" id="btnTrRevisar">${I('refresh')} Volver a consultar</button></div></div>
+      <div class="card-b">${body}</div>
+    </div>`;
+  $('#btnTrRevisar').onclick = () => mountTransito();
+  $$('[data-asignar]').forEach((b) => (b.onclick = () => abrirAsignar(lineas[Number(b.dataset.asignar)])));
+}
+
+function abrirAsignar(l) {
+  openModal(`
+    <div class="modal wide">
+      <div class="mh"><h3>${I('truck')} Asignar línea en tránsito</h3>
+        <p>Elige el item al que pertenece. Queda en su bitácora a tu nombre.</p></div>
+      <div class="mb" style="display:flex;flex-direction:column;gap:14px;">
+        ${tarjetaTransito(l)}
+        <div id="asgPicker"></div>
+        <p class="form-msg" id="asgMsg"></p>
+      </div>
+      <div class="mf">
+        <button class="btn ghost" data-close>Cancelar</button>
+        <button class="btn primary" id="asgOk">${I('checkCircle')} Asignar</button>
+      </div>
+    </div>`);
+  const msg = $('#asgMsg');
+  const pk = mountPicker($('#asgPicker'), state.trItems, () => {
+    msg.textContent = '';
+    if (pk && pk.get()) $('#asgOk').focus();
+  });
+  $('#asgOk').onclick = async () => {
+    msg.textContent = '';
+    const it = pk.get();
+    if (!it) {
+      msg.textContent = 'Selecciona el item.';
+      return pk.focus();
+    }
+    $('#asgOk').disabled = true;
+    try {
+      await http('POST', '/transito/asignar', { doc_num: l.doc_num, line_num: l.line_num, item_id: it.id });
+      closeModal();
+      toast('ok', 'Línea asignada', `${claveLinea(l)} → ${it.numero_parte}: suma ${fmt(l.cantidad)} a su tránsito.`);
+      state.tr.lineas = state.tr.lineas.filter((x) => x !== l);
+      renderTransito();
+    } catch (e) {
+      msg.textContent = e.message;
+      $('#asgOk').disabled = false;
+      // Ya no está abierta o alguien más la asignó: refresca la lista al cerrar.
+      if (e.status === 404 || e.status === 409) _modalOnClose = () => mountTransito();
+    }
+  };
 }
 
 /* ============================================================
