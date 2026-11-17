@@ -1,6 +1,3 @@
-# Secretos: el .env lleva la contraseña sa. Nunca a git (ver .env.example).
-.env
-
 venv/
 .venv/
 logs/
