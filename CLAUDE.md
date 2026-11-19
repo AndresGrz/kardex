@@ -6,7 +6,8 @@ Guía operativa de **Kardex**: qué es, cómo está construido y cómo desplegar
 
 App web interna (solo LAN) del almacén de la planta (American Tubing / ATI) para las
 **refacciones que no viven en ningún sistema** (ni Infor ni producción). Almacén registra
-números de parte, entradas, salidas y ajustes; queda un historial completo e **inmutable**.
+números de parte, entradas, salidas, ajustes y traslados; queda un historial completo e
+**inmutable**. Hay **dos almacenes**, uno por nave: **ATI** y **MAKRO**.
 Prioridad: trazabilidad y que el stock en sistema cuadre con el físico. Simplicidad para el
 almacenista por encima de funciones. UI en español.
 
@@ -32,9 +33,9 @@ infor.py       Trae y normaliza las líneas de OC en tránsito de Infor. AISLADO
 db.py          Engine, modelos SQLAlchemy, fechas UTC <-> Monterrey, verificar_esquema().
 config.py      Lectura y validación del .env (único lugar con nombres de variables).
 sql/01_crear_kardex.sql      FUENTE DE VERDAD del esquema + carga inicial. Se corre en SSMS.
-sql/02_transito.sql          Migración para la BD que ya existía: asignacion_transito + eventos
-                             de tránsito en la bitácora. Idempotente. (01 ya lo incluye.)
-sql/generar_carga_inicial.py Regenera el bloque de INSERT del SQL desde el Excel.
+                             No hay migraciones: un cambio de esquema = recrear la BD (ver Carga).
+sql/generar_carga_inicial.py Regenera los bloques de carga del SQL (VALUES + conteos esperados)
+                             desde el Excel.
 frontend/      index.html, app.js (rutas por hash, sin framework), styles.css (sistema
                visual de Dossier + secciones KARDEX), icons.js.
 tests/         conftest.py (fixtures, limpieza ZZTEST-), test_reglas.py (criterios).
@@ -47,7 +48,7 @@ deploy/run_server.bat, ecosystem.config.js, requirements.txt, .env.example
 python -m venv venv && venv\Scripts\python.exe -m pip install -r requirements.txt
 python -m uvicorn server:app --host 127.0.0.1 --port 1003 --reload   # desarrollo
 python -m pytest                                                      # pruebas (BD real)
-python sql/generar_carga_inicial.py ["C:\ruta\tools .xlsx"]           # regenerar carga inicial
+python sql/generar_carga_inicial.py ["C:\ruta\kardex final.xlsx"]  # regenerar carga inicial
 deploy\run_server.bat                                                 # como en prod, sin PM2
 ```
 
@@ -64,16 +65,20 @@ La app **no crea tablas**: al arrancar `db.verificar_esquema()` y `auth.verifica
 existan tablas, vistas, triggers (habilitados) y la columna `rol_kardex`; si falta algo, no arranca.
 
 - `items`: catálogo. `stock_activo` es un **cache** de `SUM(movimientos.cantidad)`.
+  `almacen` (`ATI | MAKRO`, NOT NULL, CHECK, **sin default**): el item vive en UN almacén a la vez.
 - `movimientos`: **inmutable** (trigger `INSTEAD OF UPDATE, DELETE`). `cantidad` con signo:
-  ENTRADA > 0, SALIDA < 0, AJUSTE ≠ 0. CHECKs de campos obligatorios por tipo.
+  ENTRADA > 0, SALIDA < 0, AJUSTE ≠ 0. CHECKs de campos obligatorios por tipo. `almacen` es una
+  **foto** del almacén del item al momento del movimiento (los viejos conservan el suyo tras un traslado).
 - `bitacora`: **inmutable**. Eventos `ALTA_ITEM | EDICION_ITEM | OBSOLETO | REVERTIR_OBSOLETO |
-  ASIGNAR_TRANSITO | QUITAR_TRANSITO`; una fila por campo editado; booleanos como "Sí"/"No".
-  Columna `motivo` para obsoleto/revertir. Tránsito: `campo='transito'`, valor `PEX000977-10 · <referencia>`.
+  ASIGNAR_TRANSITO | QUITAR_TRANSITO | TRASLADO`; una fila por campo editado; booleanos como "Sí"/"No".
+  Columna `motivo` para obsoleto/revertir/traslado. Tránsito: `campo='transito'`, valor
+  `PEX000977-10 · <referencia>`. Traslado: `campo='almacen'`, `ATI → MAKRO`, motivo obligatorio
+  (lo exige también `CK_bitacora_traslado`).
 - `asignacion_transito`: línea de OC (`doc_num` + `line_num`, PK: una línea, un item) → `item_id`,
   asignada **a mano**. **No** es inmutable: la app borra las filas de líneas que ya no salen en el
   endpoint. El rastro queda en la bitácora.
 - `vw_items_bajo_minimo`: la lee **Mercurio directo** para su correo (Kardex no envía correos ni
-  expone nada para Mercurio).
+  expone nada para Mercurio). Trae la columna `almacen` (desde v1.2) para decir a qué nave le falta.
 - `vw_chequeo_stock`: items con cache ≠ suma de movimientos. **Siempre debe estar vacía.**
 - Usuarios: tabla de Dossier + columna `rol_kardex` (`almacenista | supervisor | NULL`).
   `username` = nómina. Todo lo que referencia a un usuario guarda la **nómina** (texto).
@@ -86,6 +91,7 @@ existan tablas, vistas, triggers (habilitados) y la columna `rol_kardex`; si fal
 | Buscar, ver kardex, entrada, salida, marcar obsoleto, cambiar su contraseña | sí | sí |
 | Ver el tránsito del item (tarjetas, solo lectura) | sí | sí |
 | Alta / edición de items, ajustes, revertir obsoleto, chequeo de stock | **403** | sí |
+| Trasladar un item entre almacenes (ATI ↔ MAKRO) | **403** | sí |
 | Autorizar salida sin pieza devuelta | **403** | sí |
 | Pestaña "Tránsito por asignar", asignar y quitar líneas | **403** | sí |
 
@@ -99,12 +105,23 @@ existan tablas, vistas, triggers (habilitados) y la columna `rol_kardex`; si fal
   Es la única forma de corregir el stock.
 - **Obsoleto**: cualquier rol lo marca; conserva stock, rechaza entradas/salidas, sale de la
   alerta y de la búsqueda (salvo "incluir obsoletos"). Solo el supervisor lo revierte.
-- **Alta**: NP único (409), descripción obligatoria, máximo ≥ mínimo; `stock_inicial` entra como
-  AJUSTE "Carga inicial".
+- **Alta**: NP único en todo Kardex (409, aunque sea del otro almacén), descripción obligatoria,
+  **almacén obligatorio** (UI sin opción preseleccionada, API 400, BD NOT NULL sin default),
+  máximo ≥ mínimo; `stock_inicial` entra como AJUSTE "Carga inicial" en ese almacén.
+- **Almacenes**: los usuarios **no** están ligados a un almacén (los almacenistas rotan de nave).
+  El almacén es un dato visible y un filtro: chip en cada fila, filtro Todos | ATI | Makro que
+  recuerda el navegador (`localStorage`, cada PC está en una nave) y el almacén en grande en el
+  resumen de cada captura. No se edita (PATCH con `almacen` → 400): solo cambia con un traslado.
+- **Traslado** (`inventario.trasladar`, `POST /api/items/{id}/traslado {almacen, motivo}`): solo
+  supervisor; mueve el item **completo con todo su stock**, al momento; motivo obligatorio; se
+  permite con stock 0; **409 si está obsoleto** (primero se revierte) o si ya está en el destino.
+  El destino va explícito para que dos supervisores a la vez no lo regresen. No es movimiento (el
+  stock no cambia): va a la bitácora. UPDATE condicionado con `OUTPUT deleted.almacen`.
 - **Consistencia**: el movimiento y el cache se escriben en la misma transacción con un **UPDATE
   atómico** (`inventario._mover_stock`): `UPDATE items SET stock_activo = stock_activo + :d OUTPUT
-  inserted.stock_activo WHERE id = :id AND stock_activo + :d >= 0 [AND obsoleto = 0]`. Sin fila =
-  stock insuficiente u obsoleto. Así dos almacenistas nunca sobregiran.
+  inserted.stock_activo, inserted.almacen WHERE id = :id AND stock_activo + :d >= 0 [AND obsoleto = 0]`.
+  Sin fila = stock insuficiente u obsoleto. Así dos almacenistas nunca sobregiran, y el almacén del
+  movimiento sale de la misma fila bloqueada (una salida simultánea a un traslado no se equivoca).
 - **Tránsito (Infor)**: `GET /infor/kardex_transit` → líneas `DocNum, LineNum, Reference, UoM,
   PendingQty, CreateDate, ExpectedDeliveryDate` (fechas `dd/mm/yy`). `inventario._resolver_transito()`:
   1. Primera palabra de `Reference` == `numero_parte` (sin mayúsculas/espacios) → **automática,
@@ -141,12 +158,25 @@ habilitados y `vw_chequeo_stock` vacía. El endpoint de Infor **siempre se simul
 
 ## Carga inicial
 
-Excel `C:\Users\andres.garza\Downloads\tools .xlsx` (hoja `Sheet1`, 72 filas). Limpieza de
-`\xa0`/espacios dobles; NP repetidos (`CFB`, `20000000`, `BEND`) como `NP-<MARCA/MODELO/USO>`;
-3 sin descripción quedan como `SIN DESCRIPCION`; la fila `BROCA 11933(...)` se corrigió a
-`BROCA 9/32(...)` (Excel convirtió 9/32 en fecha). Verificación en el script: 72 items,
-66 movimientos, 0 filas en `vw_chequeo_stock`. El script nunca borra: si `kardex` ya tiene
-objetos, se detiene.
+Excel `C:\Users\andres.garza\Downloads\kardex final.xlsx` (hoja `Sheet1`), columnas por
+nombre: `NP ATIM | DESCRIPCION | MARCA/MODELO/PROCESO/USO | UOM | MINIMO | MAXIMO | STOCK | ALMACEN`
+(las demás se ignoran, p. ej. las notas de revisión). Reglas del generador:
+- `ALMACEN` obligatorio por fila (`ATI`/`MAKRO`); un NP en los dos almacenes → error.
+- MINIMO vacío → 0; MAXIMO vacío → sin máximo; STOCK vacío → error.
+- NP repetidos en el mismo almacén (`CFB`, `BEND`, …) → `NP-<MARCA/MODELO/USO>`; si así siguen
+  repetidos → error: necesitan NP único en el Excel.
+- `\xa0`/espacios dobles se limpian; sin descripción → `SIN DESCRIPCION`.
+- `OMITIR` (NP + almacén): filas que almacén decidió no cargar. Hoy solo la caja `EMB00124` de
+  MAKRO (mismo NP que la etiqueta gris de ATI). Si la fila ya no está en el Excel → error.
+- Excel final: 176 items (ATI 144, MAKRO 32), 159 movimientos.
+- Ante cualquier error no escribe nada. Si pasa, escribe los VALUES y los conteos esperados
+  (items, por almacén y movimientos); el SQL los verifica junto con 0 filas en `vw_chequeo_stock`
+  y, si no cuadra, revierte toda la carga.
+
+El script SQL nunca borra: si `kardex` ya tiene objetos, se detiene. **Recarga / cambio de
+esquema**: respaldo → `DROP DATABASE kardex` en SSMS → correr `01_crear_kardex.sql`
+(el paso de `rol_kardex` en `dossier_local` es idempotente). Se pierden movimientos, bitácora y
+asignaciones de tránsito: es empezar de cero.
 
 ## Fuera de alcance en v1 (el diseño no lo impide)
 
@@ -193,7 +223,7 @@ Servidor Windows `10.207.5.9`, PM2 → uvicorn en el **puerto 1003** con 2 worke
 | Arranca y se cae | `pm2 logs kardex`: `.env` ausente, sin `JWT_SECRET`, o falta el esquema (mensaje claro) |
 | `/api/health` responde pero el login no | BD: `DB_URL`, columna `rol_kardex`, usuario con `rol_kardex` |
 | En tránsito siempre "N/D" | `INFOR_PO_PATH` vacío (apagado) o `/infor/kardex_transit` falla (ver log) |
-| No arranca: "falta asignacion_transito" | Correr `sql/02_transito.sql` en SSMS |
+| No arranca: "falta columna items.almacen" (u otro objeto) | BD con esquema viejo: respaldo → `DROP DATABASE kardex` → `01_crear_kardex.sql` |
 
 Logs de la app en `logs/kardex.log` (rotación 5 MB, 10 archivos). Con 2 workers ambos escriben
 el mismo archivo; si una rotación choca en Windows, loguru lo reporta en consola y sigue.

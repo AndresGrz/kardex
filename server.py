@@ -122,6 +122,9 @@ class PasswordIn(_Cuerpo):
 
 class ItemCambios(_Cuerpo):
     numero_parte: str | None = None
+    # Solo vale en el alta; en la edición inventario.py lo rechaza con un
+    # mensaje claro (el almacén se cambia con un traslado).
+    almacen: str | None = None
     descripcion: str | None = None
     marca_modelo_uso: str | None = None
     unidad_medida: str | None = None
@@ -135,6 +138,11 @@ class ItemNuevo(ItemCambios):
 
 
 class MotivoIn(_Cuerpo):
+    motivo: str | None = None
+
+
+class TrasladoIn(_Cuerpo):
+    almacen: str | None = None  # destino: ATI | MAKRO
     motivo: str | None = None
 
 
@@ -239,6 +247,11 @@ def marcar_obsoleto(item_id: int, body: MotivoIn | None = None, u: dict = Usuari
 @api.post("/items/{item_id}/reactivar")
 def reactivar(item_id: int, body: MotivoIn | None = None, u: dict = Usuario):
     return inventario.reactivar(item_id, body.motivo if body else None, u)
+
+
+@api.post("/items/{item_id}/traslado")
+def trasladar(item_id: int, body: TrasladoIn, u: dict = Usuario):
+    return inventario.trasladar(item_id, body.almacen, body.motivo, u)
 
 
 @api.post("/movimientos/entrada", status_code=201)

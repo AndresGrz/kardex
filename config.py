@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 
 def _env(nombre: str, default: str = "") -> str:

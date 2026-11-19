@@ -19,6 +19,16 @@ Tránsito (OC abiertas de Infor, ver _resolver_transito()):
     llave DocNum + LineNum) y queda en la bitácora del item.
   - Las asignaciones se borran solas cuando su línea deja de salir en el endpoint.
   - Infor caído o apagado -> None ("N/D"), nunca 0.
+
+Almacenes (ATI y MAKRO):
+  - Cada item vive en UN almacén a la vez (items.almacen). Se elige en el alta
+    (obligatorio, sin valor por defecto) y no se cambia editando.
+  - Solo cambia con trasladar() (supervisor): mueve el item COMPLETO con todo
+    su stock, al momento, con motivo obligatorio. No toca el stock: queda en la
+    bitácora (TRASLADO), no en movimientos. Se rechaza si el item es obsoleto.
+  - Cada movimiento guarda el almacén del item en ese instante (lo regresa el
+    mismo UPDATE atómico, así una salida simultánea a un traslado no se equivoca).
+  - Los usuarios no están ligados a un almacén (los almacenistas rotan de nave).
 """
 import re
 from datetime import date
@@ -34,6 +44,7 @@ from db import AsignacionTransito, Bitacora, Item, Movimiento
 
 ENTRADA, SALIDA, AJUSTE = "ENTRADA", "SALIDA", "AJUSTE"
 MOTIVO_CARGA_INICIAL = "Carga inicial"
+ALMACENES = ("ATI", "MAKRO")  # mismo CHECK que items.almacen y movimientos.almacen
 
 
 class ReglaNegocio(Exception):
@@ -91,6 +102,14 @@ def _no_negativo(valor, nombre: str) -> int:
     return n
 
 
+def _almacen(valor, nombre: str = "el almacén") -> str:
+    """ATI o MAKRO (sin distinguir mayúsculas ni espacios). Obligatorio."""
+    a = " ".join(valor.split()).upper() if isinstance(valor, str) else ""
+    if a not in ALMACENES:
+        raise ReglaNegocio(f"Selecciona {nombre}: {' o '.join(ALMACENES)}.")
+    return a
+
+
 def _id_item(item_id) -> int:
     if isinstance(item_id, bool) or not isinstance(item_id, int) or item_id <= 0:
         raise ReglaNegocio("Selecciona un item.")
@@ -115,6 +134,7 @@ def item_dict(it: Item, transito: dict[int, int] | None) -> dict:
     return {
         "id": it.id,
         "numero_parte": it.numero_parte,
+        "almacen": it.almacen,
         "descripcion": it.descripcion,
         "marca_modelo_uso": it.marca_modelo_uso,
         "unidad_medida": it.unidad_medida,
@@ -138,6 +158,7 @@ def mov_dict(m: Movimiento) -> dict:
         "id": m.id,
         "item_id": m.item_id,
         "tipo": m.tipo,
+        "almacen": m.almacen,
         "cantidad": m.cantidad,
         "stock_resultante": m.stock_resultante,
         "usuario_nomina": m.usuario_nomina,
@@ -516,11 +537,13 @@ def _es_unique_np(e: IntegrityError) -> bool:
 
 
 def crear_item(datos: dict, usuario: dict) -> dict:
-    """Alta (supervisor). `stock_inicial` opcional entra como AJUSTE 'Carga inicial'."""
+    """Alta (supervisor). `almacen` obligatorio (ATI | MAKRO, sin default).
+    `stock_inicial` opcional entra como AJUSTE 'Carga inicial' en ese almacén."""
     _exigir_supervisor(usuario, "dar de alta items")
     datos = dict(datos)
     stock_inicial = datos.pop("stock_inicial", None)
     stock_inicial = 0 if stock_inicial is None else _no_negativo(stock_inicial, "El stock inicial")
+    almacen = datos.pop("almacen", None)
     desconocidos = set(datos) - set(CAMPOS_EDITABLES)
     if desconocidos:
         raise ReglaNegocio(f"Campo desconocido: {', '.join(sorted(desconocidos))}.")
@@ -529,6 +552,7 @@ def crear_item(datos: dict, usuario: dict) -> dict:
         "inventario_minimo": 0, "inventario_maximo": None, "requiere_cambio": False,
     }
     v = _validar_campos({**base, **datos})
+    v["almacen"] = _almacen(almacen, "el almacén del item")
     _validar_min_max(v["inventario_minimo"], v["inventario_maximo"])
 
     ahora = db.ahora_utc()
@@ -548,21 +572,26 @@ def crear_item(datos: dict, usuario: dict) -> dict:
             ))
             if stock_inicial > 0:
                 s.add(Movimiento(
-                    item_id=it.id, tipo=AJUSTE, cantidad=stock_inicial, stock_resultante=stock_inicial,
+                    item_id=it.id, tipo=AJUSTE, almacen=it.almacen,
+                    cantidad=stock_inicial, stock_resultante=stock_inicial,
                     motivo=MOTIVO_CARGA_INICIAL, usuario_nomina=usuario["nomina"], fecha_hora=ahora,
                 ))
     except IntegrityError as e:
         if _es_unique_np(e):  # dos altas simultáneas del mismo NP
             raise _np_duplicado(v["numero_parte"])
         raise
-    logger.info(f"ALTA_ITEM {it.numero_parte} (id {it.id}) stock_inicial={stock_inicial} por {usuario['nomina']}")
+    logger.info(f"ALTA_ITEM {it.numero_parte} (id {it.id}) almacen={it.almacen} "
+                f"stock_inicial={stock_inicial} por {usuario['nomina']}")
     return item_dict(it, _transito_por_item())
 
 
 def editar_item(item_id: int, cambios: dict, usuario: dict) -> dict:
-    """Edición (supervisor): una fila EDICION_ITEM por campo que cambió."""
+    """Edición (supervisor): una fila EDICION_ITEM por campo que cambió.
+    El almacén no se edita: se usa trasladar()."""
     _exigir_supervisor(usuario, "editar items")
     item_id = _id_item(item_id)
+    if "almacen" in cambios:
+        raise ReglaNegocio("El almacén no se edita: usa «Trasladar» (queda en la bitácora con su motivo).")
     desconocidos = set(cambios) - set(CAMPOS_EDITABLES)
     if desconocidos:
         raise ReglaNegocio(f"Campo no editable: {', '.join(sorted(desconocidos))}.")
@@ -652,20 +681,68 @@ def reactivar(item_id: int, motivo, usuario: dict) -> dict:
 
 
 # ============================================================
+# Traslado entre almacenes (ATI <-> MAKRO)
+# ============================================================
+def trasladar(item_id: int, almacen_destino, motivo, usuario: dict) -> dict:
+    """Pasa el item COMPLETO, con todo su stock, a otro almacén (supervisor).
+
+    Se cierra al momento y el stock no cambia, así que no es un movimiento:
+    queda en la bitácora (TRASLADO, campo 'almacen', de -> a, con motivo
+    obligatorio). Se permite con stock 0 y se rechaza si el item es obsoleto.
+
+    El destino va explícito (no "el otro"): si dos supervisores trasladan a la
+    vez, el segundo recibe 409 en lugar de regresar el item a donde estaba."""
+    _exigir_supervisor(usuario, "trasladar items entre almacenes")
+    item_id = _id_item(item_id)
+    destino = _almacen(almacen_destino, "el almacén destino")
+    motivo = _texto(motivo, "El motivo del traslado", 500, obligatorio=True)
+    ahora = db.ahora_utc()
+    # UPDATE condicionado: valida y cambia en una sola sentencia (items no tiene
+    # triggers, así que OUTPUT sí se permite).
+    sql = ("UPDATE dbo.items SET almacen = :destino "
+           "OUTPUT deleted.almacen, inserted.stock_activo "
+           "WHERE id = :id AND obsoleto = 0 AND almacen <> :destino")
+    with db.sesion() as s, s.begin():
+        row = s.execute(text(sql), {"destino": destino, "id": item_id}).first()
+        if row is None:
+            it = s.get(Item, item_id)
+            if it is None:
+                raise ReglaNegocio("El item no existe.", 404)
+            if it.obsoleto:
+                raise ReglaNegocio(
+                    f"{it.numero_parte} está obsoleto: no se traslada. Primero revierte el obsoleto.", 409
+                )
+            raise ReglaNegocio(f"{it.numero_parte} ya está en {destino}.", 409)
+        origen, stock = row
+        s.add(Bitacora(
+            item_id=item_id, evento="TRASLADO", campo="almacen",
+            valor_anterior=origen, valor_nuevo=destino, motivo=motivo,
+            usuario_nomina=usuario["nomina"], fecha_hora=ahora,
+        ))
+    with db.sesion() as s:
+        it = s.get(Item, item_id)
+    logger.info(f"TRASLADO {it.numero_parte} (id {item_id}) {origen} -> {destino} "
+                f"stock={stock} por {usuario['nomina']}")
+    return item_dict(it, _transito_por_item())
+
+
+# ============================================================
 # Movimientos (inmutables: solo se insertan)
 # ============================================================
-def _mover_stock(s, item_id: int, delta: int, permitir_obsoleto: bool) -> int | None:
-    """UPDATE atómico: valida y suma en una sola sentencia y regresa el stock
-    nuevo (= stock_resultante). None si el item no existe, el stock quedaría
-    negativo o (sin permitir_obsoleto) el item está obsoleto. Dos salidas
-    simultáneas se serializan en el candado de la fila: nunca se sobregira."""
+def _mover_stock(s, item_id: int, delta: int, permitir_obsoleto: bool) -> tuple[int, str] | None:
+    """UPDATE atómico: valida y suma en una sola sentencia y regresa
+    (stock nuevo = stock_resultante, almacén del item). None si el item no
+    existe, el stock quedaría negativo o (sin permitir_obsoleto) el item está
+    obsoleto. Dos salidas simultáneas se serializan en el candado de la fila:
+    nunca se sobregira. El almacén sale de la misma fila bloqueada, así que un
+    traslado simultáneo no deja el movimiento con el almacén equivocado."""
     sql = ("UPDATE dbo.items SET stock_activo = stock_activo + :d "
-           "OUTPUT inserted.stock_activo "
+           "OUTPUT inserted.stock_activo, inserted.almacen "
            "WHERE id = :id AND stock_activo + :d >= 0")
     if not permitir_obsoleto:
         sql += " AND obsoleto = 0"
     row = s.execute(text(sql), {"d": delta, "id": item_id}).first()
-    return None if row is None else row[0]
+    return None if row is None else (row[0], row[1])
 
 
 def _rechazo_stock(s, item_id: int, tipo: str, delta: int) -> ReglaNegocio:
@@ -687,16 +764,17 @@ def _rechazo_stock(s, item_id: int, tipo: str, delta: int) -> ReglaNegocio:
 def _insertar_movimiento(item_id: int, tipo: str, delta: int, usuario: dict, **campos) -> dict:
     """Movimiento + cache de stock en UNA transacción. Los ajustes sí aplican a obsoletos."""
     with db.sesion() as s, s.begin():
-        stock = _mover_stock(s, item_id, delta, permitir_obsoleto=(tipo == AJUSTE))
-        if stock is None:
+        movido = _mover_stock(s, item_id, delta, permitir_obsoleto=(tipo == AJUSTE))
+        if movido is None:
             raise _rechazo_stock(s, item_id, tipo, delta)
+        stock, almacen = movido
         m = Movimiento(
-            item_id=item_id, tipo=tipo, cantidad=delta, stock_resultante=stock,
+            item_id=item_id, tipo=tipo, almacen=almacen, cantidad=delta, stock_resultante=stock,
             usuario_nomina=usuario["nomina"], fecha_hora=db.ahora_utc(), **campos,
         )
         s.add(m)
         s.flush()
-    logger.info(f"{tipo} item {item_id} cantidad={delta} stock={stock} por {usuario['nomina']}")
+    logger.info(f"{tipo} item {item_id} [{almacen}] cantidad={delta} stock={stock} por {usuario['nomina']}")
     return mov_dict(m)
 
 

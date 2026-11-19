@@ -210,10 +210,12 @@ def transito(monkeypatch):
 
 @pytest.fixture
 def nuevo_item(client, H):
-    """Crea un item ZZTEST- vía API (como supervisor) y regresa su dict."""
+    """Crea un item ZZTEST- vía API (como supervisor) y regresa su dict.
+    Almacén ATI salvo que se pida otro (el alta lo exige)."""
     def _crear(**kw):
         datos = {
             "numero_parte": f"{PREFIJO}{uuid.uuid4().hex[:10].upper()}",
+            "almacen": "ATI",
             "descripcion": "Item de prueba",
             **kw,
         }

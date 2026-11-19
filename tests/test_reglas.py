@@ -266,7 +266,9 @@ def test_alta_con_stock_inicial(client, H, nuevo_item):
     it = nuevo_item(stock_inicial=12, marca_modelo_uso="3/4", inventario_minimo=2, inventario_maximo=20)
     assert it["stock_activo"] == 12 and it["unidad_medida"] == "EACH" and it["creado_por"] == "ZZTEST-SUP"
     k = client.get(f"/api/items/{it['id']}", headers=H["alm"]).json()
-    assert [(m["tipo"], m["cantidad"], m["motivo"]) for m in k["movimientos"]] == [("AJUSTE", 12, "Carga inicial")]
+    assert [(m["tipo"], m["almacen"], m["cantidad"], m["motivo"]) for m in k["movimientos"]] == [
+        ("AJUSTE", "ATI", 12, "Carga inicial"),
+    ]
     assert [b["evento"] for b in k["bitacora"]] == ["ALTA_ITEM"]
 
 
@@ -275,15 +277,15 @@ def test_alta_validaciones(client, H, nuevo_item):
     assert client.post("/api/items", json={"numero_parte": "ZZTEST-SIN-DESC"}, headers=sup).status_code == 400
     assert client.post("/api/items", json={"descripcion": "sin np"}, headers=sup).status_code == 400
     r = client.post("/api/items", json={
-        "numero_parte": "ZZTEST-MAXMIN", "descripcion": "x", "inventario_minimo": 10, "inventario_maximo": 5,
+        "numero_parte": "ZZTEST-MAXMIN", "almacen": "ATI", "descripcion": "x", "inventario_minimo": 10, "inventario_maximo": 5,
     }, headers=sup)
     assert r.status_code == 400 and "máximo" in r.json()["detail"]
 
 
 def test_alta_np_duplicado_409(client, H, nuevo_item):
     it = nuevo_item()
-    r = client.post("/api/items", json={"numero_parte": it["numero_parte"], "descripcion": "otra"}, headers=H["sup"])
-    assert r.status_code == 409
+    r = client.post("/api/items", json={"numero_parte": it["numero_parte"], "almacen": "MAKRO", "descripcion": "otra"}, headers=H["sup"])
+    assert r.status_code == 409  # el NP es único aunque sea en el otro almacén
 
 
 def test_edicion_registra_una_fila_por_campo(client, H, nuevo_item):
@@ -310,6 +312,173 @@ def test_edicion_registra_una_fila_por_campo(client, H, nuevo_item):
     assert r.status_code == 409
     # stock no es editable
     assert client.patch(f"/api/items/{it['id']}", json={"stock_activo": 99}, headers=H["sup"]).status_code == 400
+
+
+# ============================================================
+# Almacenes (ATI | MAKRO) y traslados
+# ============================================================
+def trasladar(client, H, item_id, almacen, motivo="ZZTEST se movió la línea", rol="sup"):
+    return client.post(f"/api/items/{item_id}/traslado", json={"almacen": almacen, "motivo": motivo}, headers=H[rol])
+
+
+def _item_existe(numero_parte):
+    with db.engine().connect() as c:
+        return bool(c.execute(
+            text("SELECT COUNT(*) FROM dbo.items WHERE numero_parte = :np"), {"np": numero_parte}
+        ).scalar())
+
+
+def test_alta_exige_almacen(client, H, nuevo_item):
+    base = {"descripcion": "Item de prueba"}
+    for i, almacen in enumerate((None, "", "   ", "MONTERREY", 1)):
+        np = f"ZZTEST-ALM{i}"
+        body = {**base, "numero_parte": np} | ({} if almacen is None else {"almacen": almacen})
+        r = client.post("/api/items", json=body, headers=H["sup"])
+        assert r.status_code in (400, 422), (almacen, r.text)  # 1 (no texto) lo rechaza Pydantic
+        assert not _item_existe(np)
+    r = client.post("/api/items", json={**base, "numero_parte": "ZZTEST-ALM0"}, headers=H["sup"])
+    assert "almacén" in r.json()["detail"]
+    # sin distinguir mayúsculas ni espacios
+    it = nuevo_item(almacen=" makro ")
+    assert it["almacen"] == "MAKRO"
+
+
+def test_almacen_no_se_edita(client, H, nuevo_item):
+    it = nuevo_item()
+    r = client.patch(f"/api/items/{it['id']}", json={"almacen": "MAKRO"}, headers=H["sup"])
+    assert r.status_code == 400 and "Trasladar" in r.json()["detail"]
+    k = client.get(f"/api/items/{it['id']}", headers=H["sup"]).json()
+    assert k["item"]["almacen"] == "ATI"
+    assert [b["evento"] for b in k["bitacora"]] == ["ALTA_ITEM"]
+
+
+def test_traslado(client, H, nuevo_item):
+    it = nuevo_item(stock_inicial=7, inventario_minimo=10)  # bajo mínimo
+    # solo supervisor, con motivo y a un almacén válido distinto al actual
+    assert trasladar(client, H, it["id"], "MAKRO", rol="alm").status_code == 403
+    assert trasladar(client, H, it["id"], "MAKRO", motivo="").status_code == 400
+    assert trasladar(client, H, it["id"], "MAKRO", motivo=None).status_code == 400
+    assert trasladar(client, H, it["id"], "MONTERREY").status_code == 400
+    r = trasladar(client, H, it["id"], "ATI")
+    assert r.status_code == 409 and "ya está en ATI" in r.json()["detail"]
+    assert trasladar(client, H, 999999999, "MAKRO").status_code == 404
+
+    r = trasladar(client, H, it["id"], "makro", motivo="la línea de mandriles se fue a Makro")
+    assert r.status_code == 200, r.text
+    assert (r.json()["almacen"], r.json()["stock_activo"]) == ("MAKRO", 7)  # todo el stock se va
+    assert stock_de(it["id"]) == 7
+    # doble clic / dos supervisores: el segundo no lo regresa
+    assert trasladar(client, H, it["id"], "MAKRO").status_code == 409
+
+    # queda en la bitácora (no en movimientos: el stock no cambió)
+    k = client.get(f"/api/items/{it['id']}", headers=H["alm"]).json()
+    b = k["bitacora"][0]
+    assert (b["evento"], b["campo"], b["valor_anterior"], b["valor_nuevo"], b["motivo"], b["usuario_nomina"]) == (
+        "TRASLADO", "almacen", "ATI", "MAKRO", "la línea de mandriles se fue a Makro", "ZZTEST-SUP",
+    )
+    assert len(k["movimientos"]) == 1
+
+    # los movimientos nuevos se registran en el almacén nuevo; los viejos conservan el suyo
+    assert entrada(client, H, "alm", it["id"], cantidad=2).json()["almacen"] == "MAKRO"
+    assert salida(client, H, "alm", it["id"], cantidad=1).json()["almacen"] == "MAKRO"
+    k = client.get(f"/api/items/{it['id']}", headers=H["alm"]).json()
+    assert [(m["tipo"], m["almacen"]) for m in k["movimientos"]] == [
+        ("SALIDA", "MAKRO"), ("ENTRADA", "MAKRO"), ("AJUSTE", "ATI"),
+    ]
+    # la vista de Mercurio dice a qué nave le falta
+    with db.engine().connect() as c:
+        alm = c.execute(text("SELECT almacen FROM dbo.vw_items_bajo_minimo WHERE numero_parte = :np"),
+                        {"np": it["numero_parte"]}).scalar()
+    assert alm == "MAKRO"
+    assert client.get("/api/chequeo-stock", headers=H["sup"]).json() == {"ok": True, "filas": []}
+
+
+def test_traslado_con_stock_cero_y_obsoleto(client, H, nuevo_item):
+    vacio = nuevo_item()
+    assert trasladar(client, H, vacio["id"], "MAKRO").status_code == 200  # se permite con stock 0
+    it = nuevo_item(stock_inicial=3)
+    assert client.post(f"/api/items/{it['id']}/obsoleto", json={}, headers=H["alm"]).status_code == 200
+    r = trasladar(client, H, it["id"], "MAKRO")
+    assert r.status_code == 409 and "obsoleto" in r.json()["detail"]
+    assert client.post(f"/api/items/{it['id']}/reactivar", json={}, headers=H["sup"]).status_code == 200
+    assert trasladar(client, H, it["id"], "MAKRO").status_code == 200
+    assert stock_de(it["id"]) == 3
+
+
+def test_bitacora_rechaza_traslado_incompleto(nuevo_item):
+    """La BD exige campo 'almacen', de un almacén a otro y motivo (CK_bitacora_traslado)."""
+    it = nuevo_item()
+    for anterior, nuevo, motivo in (("ATI", "MAKRO", None), ("ATI", "ATI", "x"), ("ATI", "OTRO", "x")):
+        with pytest.raises(DBAPIError):
+            with db.engine().begin() as c:
+                c.execute(text(
+                    "INSERT INTO dbo.bitacora (item_id, evento, campo, valor_anterior, valor_nuevo, motivo, usuario_nomina) "
+                    "VALUES (:id, N'TRASLADO', N'almacen', :a, :n, :m, N'ZZTEST-SUP')"
+                ), {"id": it["id"], "a": anterior, "n": nuevo, "m": motivo})
+
+
+def test_traslado_concurrente(nuevo_item, U):
+    """Dos supervisores trasladan a la vez: uno gana, el otro recibe 409; una sola fila en la bitácora."""
+    it = nuevo_item(stock_inicial=4)
+    barrera = threading.Barrier(6)
+    ok, rechazos, errores = [], [], []
+
+    def mover():
+        barrera.wait()
+        try:
+            ok.append(inventario.trasladar(it["id"], "MAKRO", "ZZTEST hilo", U["sup"])["almacen"])
+        except inventario.ReglaNegocio as e:
+            rechazos.append(e.status)
+        except Exception as e:
+            errores.append(repr(e))
+
+    hilos = [threading.Thread(target=mover) for _ in range(6)]
+    for h in hilos:
+        h.start()
+    for h in hilos:
+        h.join()
+    assert errores == [] and ok == ["MAKRO"] and rechazos == [409] * 5
+    with db.engine().connect() as c:
+        n = c.execute(text("SELECT COUNT(*) FROM dbo.bitacora WHERE item_id = :id AND evento = N'TRASLADO'"),
+                      {"id": it["id"]}).scalar()
+    assert n == 1
+
+
+def test_salidas_durante_un_traslado(nuevo_item, U):
+    """Cada salida queda con el almacén en que estaba el item al moverse: en
+    orden de registro, primero todas las de ATI y luego todas las de MAKRO."""
+    it = nuevo_item(stock_inicial=10)
+    barrera = threading.Barrier(9)
+    errores = []
+
+    def sacar():
+        barrera.wait()
+        try:
+            inventario.registrar_salida(it["id"], 1, "ZZTEST Prod", "ZZTEST-SOL", "Hilo", U["alm"])
+        except Exception as e:
+            errores.append(repr(e))
+
+    def mover():
+        barrera.wait()
+        try:
+            inventario.trasladar(it["id"], "MAKRO", "ZZTEST hilo", U["sup"])
+        except Exception as e:
+            errores.append(repr(e))
+
+    hilos = [threading.Thread(target=sacar) for _ in range(8)] + [threading.Thread(target=mover)]
+    for h in hilos:
+        h.start()
+    for h in hilos:
+        h.join()
+    assert errores == []
+    with db.engine().connect() as c:
+        almacenes = c.execute(text(
+            "SELECT almacen FROM dbo.movimientos WHERE item_id = :id AND tipo = N'SALIDA' ORDER BY id"
+        ), {"id": it["id"]}).scalars().all()
+    assert len(almacenes) == 8
+    assert almacenes == sorted(almacenes)  # 'ATI' < 'MAKRO': nunca una de ATI después de una de MAKRO
+    assert stock_de(it["id"]) == 2
+    assert inventario.chequeo_stock(U["sup"]) == {"ok": True, "filas": []}
 
 
 def test_busqueda(client, H, nuevo_item):

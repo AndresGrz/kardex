@@ -616,6 +616,37 @@ kbd { font-family: var(--mono); font-size: 11px; font-weight: 600; background: v
 .loading { color: var(--ink-3); font-size: 13.5px; padding: 30px; text-align: center; }
 
 /* ============================================================
+   KARDEX — almacenes (ATI | MAKRO)
+   Dos colores que no se confunden entre sí ni con los chips de estado.
+   ============================================================ */
+:root {
+  --alm-ati:   var(--black);
+  --alm-makro: oklch(0.50 0.14 300);
+}
+.chip.alm { color: #fff; border-color: transparent; background: var(--alm-ati); }
+.chip.alm-makro { background: var(--alm-makro); }
+
+/* Resumen de captura: el almacén en grande, justo antes de guardar. */
+.alm-big { display: flex; align-items: center; gap: 10px; padding: 10px 14px; margin-bottom: 12px; border-radius: var(--r-md); color: #fff; background: var(--alm-ati); }
+.alm-big.alm-makro { background: var(--alm-makro); }
+.alm-big svg { width: 22px; height: 22px; flex: none; }
+.alm-big small { display: block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; opacity: .8; }
+.alm-big b { font-size: 22px; font-weight: 800; letter-spacing: -.02em; line-height: 1.1; }
+
+/* Alta: el almacén es obligatorio y no trae nada marcado. */
+.choices.invalid .choice { border-color: var(--danger); box-shadow: 0 0 0 3px oklch(0.585 0.16 27 / .10); }
+
+/* Modal de traslado: de -> a con el stock que se mueve. */
+.traslado { display: flex; align-items: center; justify-content: center; gap: 18px; padding: 14px; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r-md); }
+.traslado .box { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.traslado .box small { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-3); }
+.traslado .arrow { color: var(--ink-3); display: flex; flex-direction: column; align-items: center; gap: 2px; font-weight: 800; font-size: 13px; font-variant-numeric: tabular-nums; }
+.traslado .arrow svg { width: 22px; height: 22px; }
+
+/* Inventario: dos selectores (almacén y bajo mínimo) en la misma cabecera. */
+.card-h:has(.seg + .seg) { flex-wrap: wrap; }
+
+/* ============================================================
    RESPONSIVO (PC de almacén primero)
    ============================================================ */
 @media (max-width: 1180px) {

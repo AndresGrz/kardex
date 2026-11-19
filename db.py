@@ -79,6 +79,7 @@ class Item(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     numero_parte: Mapped[str] = mapped_column(Unicode(60))
+    almacen: Mapped[str] = mapped_column(Unicode(10))  # ATI | MAKRO; solo cambia con un traslado
     descripcion: Mapped[str] = mapped_column(Unicode(200))
     marca_modelo_uso: Mapped[str | None] = mapped_column(Unicode(200))
     unidad_medida: Mapped[str] = mapped_column(Unicode(20))
@@ -100,6 +101,7 @@ class Movimiento(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     item_id: Mapped[int] = mapped_column(ForeignKey("items.id"))
     tipo: Mapped[str] = mapped_column(Unicode(10))
+    almacen: Mapped[str] = mapped_column(Unicode(10))  # foto: dónde estaba el item al moverse
     cantidad: Mapped[int] = mapped_column(Integer)
     stock_resultante: Mapped[int] = mapped_column(Integer)
     usuario_nomina: Mapped[str] = mapped_column(Unicode(50))
@@ -158,8 +160,10 @@ OBJETOS_REQUERIDOS = {
     "vw_chequeo_stock": "V",
 }
 TRIGGERS_REQUERIDOS = ("tr_movimientos_inmutable", "tr_bitacora_inmutable")
-# El CHECK de bitacora.evento debe aceptar los eventos de tránsito (sql/02_transito.sql).
-EVENTOS_REQUERIDOS = ("ASIGNAR_TRANSITO", "QUITAR_TRANSITO")
+# El CHECK de bitacora.evento debe aceptar los eventos de tránsito y el traslado.
+EVENTOS_REQUERIDOS = ("ASIGNAR_TRANSITO", "QUITAR_TRANSITO", "TRASLADO")
+# Columnas agregadas después de la v1 (BD vieja = hay que recrearla).
+COLUMNAS_REQUERIDAS = (("items", "almacen"), ("movimientos", "almacen"))
 
 
 def verificar_esquema() -> None:
@@ -178,14 +182,23 @@ def verificar_esquema() -> None:
             "SELECT definition FROM sys.check_constraints "
             "WHERE name = 'CK_bitacora_evento' AND parent_object_id = OBJECT_ID('dbo.bitacora')"
         )).scalar() or ""
+        columnas = {
+            (r.tabla, r.columna)
+            for r in c.execute(text(
+                "SELECT OBJECT_NAME(object_id) AS tabla, name AS columna FROM sys.columns "
+                "WHERE object_id IN (OBJECT_ID('dbo.items'), OBJECT_ID('dbo.movimientos'))"
+            ))
+        }
     faltan = [n for n, t in OBJETOS_REQUERIDOS.items() if objetos.get(n) != t]
+    faltan += [f"columna {t}.{col}" for t, col in COLUMNAS_REQUERIDAS if (t, col) not in columnas]
     faltan += [n for n in TRIGGERS_REQUERIDOS if n not in triggers]
     faltan += [f"evento {e} en CK_bitacora_evento" for e in EVENTOS_REQUERIDOS if e not in check_evento]
     if faltan:
         raise RuntimeError(
             f"La BD no tiene el esquema de Kardex (faltan: {', '.join(faltan)}). "
-            "Corre en SSMS sql/01_crear_kardex.sql (BD nueva) o sql/02_transito.sql "
-            "(BD que ya existía). La app no crea tablas."
+            "Crea la BD con sql/01_crear_kardex.sql en SSMS (si ya existe una BD "
+            "kardex vieja: respaldo -> DROP DATABASE kardex -> correr el script). "
+            "La app no crea tablas."
         )
     apagados = [n for n in TRIGGERS_REQUERIDOS if triggers[n]]
     if apagados:

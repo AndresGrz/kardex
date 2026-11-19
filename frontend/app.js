@@ -21,6 +21,21 @@ function setToken(t) {
   try { t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY); } catch (_) {}
 }
 
+/* ---------- almacenes (ATI | MAKRO; mismo CHECK que items.almacen) ---------- */
+const ALMACENES = ['ATI', 'MAKRO'];
+const ALMACEN_LABEL = { ATI: 'ATI', MAKRO: 'Makro' };
+const ALMACEN_KEY = 'kardex_almacen';
+function leerAlmacenGuardado() {
+  try {
+    const a = localStorage.getItem(ALMACEN_KEY);
+    return ALMACENES.includes(a) ? a : 'todos';
+  } catch (_) { return 'todos'; }
+}
+function guardarAlmacen(a) {
+  try { localStorage.setItem(ALMACEN_KEY, a); } catch (_) {}
+}
+const otroAlmacen = (a) => ALMACENES.find((x) => x !== a);
+
 /* ---------- HTTP ---------- */
 class ApiError extends Error {
   constructor(message, status) { super(message); this.status = status; }
@@ -59,8 +74,9 @@ const state = {
   user: null,
   version: '',
   route: { name: 'buscar', id: null, query: {} },
-  // Buscar
-  q: '', obsoletos: false, filtro: 'todos', items: [], transDisp: true, sel: 0,
+  // Buscar. almacen: filtro Todos | ATI | MAKRO que recuerda este navegador
+  // (cada PC está en una nave). Solo es comodidad: si no hay storage, 'todos'.
+  q: '', obsoletos: false, filtro: 'todos', almacen: leerAlmacenGuardado(), items: [], transDisp: true, sel: 0,
   // Kardex del item
   kx: null, kxTab: 'mov',
   // Tránsito por asignar (supervisor): líneas sin item y catálogo para el selector
@@ -92,6 +108,11 @@ function recalcBajoMinimo(it) {
   it.bajo_minimo = !it.obsoleto && it.inventario_minimo > 0 && it.stock_activo <= it.inventario_minimo;
 }
 
+// Chip del almacén: ATI y Makro con colores distintos para que no se confundan.
+function almacenChip(a, sm = true) {
+  return `<span class="chip ${sm ? 'sm' : ''} alm alm-${esc(String(a).toLowerCase())}">${I('pkg')}${esc(ALMACEN_LABEL[a] || a)}</span>`;
+}
+
 function itemChips(it) {
   const c = [];
   if (it.obsoleto) c.push(`<span class="chip danger sm">${I('archive')}Obsoleto</span>`);
@@ -115,11 +136,12 @@ const EVENTO = {
   REVERTIR_OBSOLETO: ['ok', 'undo', 'Reactivado'],
   ASIGNAR_TRANSITO: ['info', 'truck', 'Tránsito asignado'],
   QUITAR_TRANSITO: ['', 'truck', 'Tránsito quitado'],
+  TRASLADO: ['warn', 'swap', 'Traslado'],
 };
 const CAMPOS = {
   numero_parte: 'Número de parte', descripcion: 'Descripción', marca_modelo_uso: 'Marca/modelo/uso',
   unidad_medida: 'Unidad', inventario_minimo: 'Mínimo', inventario_maximo: 'Máximo',
-  requiere_cambio: 'Requiere cambio', obsoleto: 'Obsoleto',
+  requiere_cambio: 'Requiere cambio', obsoleto: 'Obsoleto', almacen: 'Almacén',
 };
 
 /* Tarjeta de una línea de OC en tránsito (kardex del item y pestaña Tránsito).
@@ -539,8 +561,14 @@ async function cargarItems() {
   renderBuscar();
 }
 
+// Items del almacén elegido (o todos). Las tarjetas de arriba cuentan sobre esto.
+function itemsAlmacen() {
+  return state.almacen === 'todos' ? state.items : state.items.filter((i) => i.almacen === state.almacen);
+}
+
 function itemsFiltrados() {
-  return state.filtro === 'bajo' ? state.items.filter((i) => i.bajo_minimo) : state.items;
+  const base = itemsAlmacen();
+  return state.filtro === 'bajo' ? base.filter((i) => i.bajo_minimo) : base;
 }
 
 function marcarSel() {
@@ -550,8 +578,10 @@ function marcarSel() {
 }
 
 function renderBuscar() {
-  const todos = state.items;
+  const todos = itemsAlmacen();
   const rows = itemsFiltrados();
+  const porAlmacen = (a) => state.items.filter((i) => i.almacen === a).length;
+  const ocultos = state.items.length - todos.length; // los esconde el filtro de almacén
   const bajo = todos.filter((i) => i.bajo_minimo).length;
   const cambio = todos.filter((i) => i.requiere_cambio).length;
   const unidades = todos.reduce((a, i) => a + i.stock_activo, 0);
@@ -559,7 +589,7 @@ function renderBuscar() {
 
   $('#buscarBody').innerHTML = `
     <div class="stat-row" style="margin-bottom:14px;">
-      <div class="stat"><div class="k">Items</div><div class="v">${fmt(todos.length)}</div><div class="d">${q ? 'en esta búsqueda' : state.obsoletos ? 'incluye obsoletos' : 'activos'}</div></div>
+      <div class="stat"><div class="k">Items${state.almacen === 'todos' ? '' : ` · ${esc(ALMACEN_LABEL[state.almacen])}`}</div><div class="v">${fmt(todos.length)}</div><div class="d">${q ? 'en esta búsqueda' : state.obsoletos ? 'incluye obsoletos' : 'activos'}</div></div>
       <div class="stat ${bajo ? 'warn' : ''}"><div class="k">Bajo mínimo</div><div class="v">${fmt(bajo)}</div><div class="d">stock ≤ mínimo</div></div>
       <div class="stat"><div class="k">Requieren cambio</div><div class="v">${fmt(cambio)}</div><div class="d">se entregan contra pieza usada</div></div>
       <div class="stat"><div class="k">Unidades en stock</div><div class="v">${fmt(unidades)}</div><div class="d">suma de activos</div></div>
@@ -569,6 +599,11 @@ function renderBuscar() {
 
     <div class="card">
       <div class="card-h">
+        <div class="seg" title="Este navegador recuerda el almacén elegido">
+          <button class="${state.almacen === 'todos' ? 'active' : ''}" data-almacen="todos">${I('layers')} Todos <span class="badge-n">${state.items.length}</span></button>
+          ${ALMACENES.map((a) => `
+          <button class="${state.almacen === a ? 'active' : ''}" data-almacen="${a}">${I('pkg')} ${ALMACEN_LABEL[a]} <span class="badge-n">${porAlmacen(a)}</span></button>`).join('')}
+        </div>
         <div class="seg">
           <button class="${state.filtro === 'todos' ? 'active' : ''}" data-filtro="todos">${I('list')} Todos <span class="badge-n">${todos.length}</span></button>
           <button class="${state.filtro === 'bajo' ? 'active' : ''}" data-filtro="bajo">${I('trendDown')} Bajo mínimo <span class="badge-n">${bajo}</span></button>
@@ -579,13 +614,14 @@ function renderBuscar() {
         ${rows.length ? `
         <table class="tbl" id="tblItems">
           <thead><tr>
-            <th>Número de parte</th><th>Descripción</th><th>Uso / medida</th>
+            <th>Número de parte</th><th>Almacén</th><th>Descripción</th><th>Uso / medida</th>
             <th class="r">Activo</th><th class="r">En tránsito</th><th class="r">Mín.</th><th class="r">Máx.</th><th>Etiquetas</th>
           </tr></thead>
           <tbody>
             ${rows.map((it, i) => `
             <tr class="click ${i === state.sel ? 'sel' : ''}" data-go="#/item/${it.id}">
               <td class="np">${esc(it.numero_parte)}</td>
+              <td>${almacenChip(it.almacen)}</td>
               <td>${esc(it.descripcion)}</td>
               <td class="muted">${it.marca_modelo_uso ? esc(it.marca_modelo_uso) : '—'}</td>
               <td class="num r" title="${esc(it.unidad_medida)}"><b>${fmt(it.stock_activo)}</b></td>
@@ -599,12 +635,21 @@ function renderBuscar() {
         <div class="empty"><div class="ic">${I('search')}</div>
           <b>${q ? `Sin resultados para “${esc(q)}”` : 'Sin items'}</b>
           ${state.filtro === 'bajo' ? 'Ningún item está bajo su mínimo.' : state.obsoletos ? '' : 'Activa “Incluir obsoletos” si buscas un item dado de baja.'}
+          ${ocultos ? `<span>Hay ${fmt(ocultos)} más en el otro almacén: <a href="#" data-almacen="todos">ver todos</a>.</span>` : ''}
         </div>`}
       </div>
     </div>`;
 
   $$('[data-filtro]').forEach((b) => (b.onclick = () => {
     state.filtro = b.dataset.filtro;
+    state.sel = 0;
+    renderBuscar();
+    $('#topSearch').focus();
+  }));
+  $$('[data-almacen]').forEach((b) => (b.onclick = (e) => {
+    e.preventDefault();
+    state.almacen = b.dataset.almacen;
+    guardarAlmacen(state.almacen);
     state.sel = 0;
     renderBuscar();
     $('#topSearch').focus();
@@ -640,6 +685,7 @@ function renderItem() {
   <div class="row" style="margin-bottom:14px;gap:12px;flex-wrap:wrap;">
     <button class="btn sm ghost" data-go="#/buscar">${I('chevL')} Inventario</button>
     <h2 class="mono" style="margin:0;font-size:20px;font-weight:700;letter-spacing:-.02em;">${esc(it.numero_parte)}</h2>
+    ${almacenChip(it.almacen, false)}
     <div class="row" style="gap:6px;">${itemChips(it)}</div>
   </div>
 
@@ -659,6 +705,7 @@ function renderItem() {
         <div class="card-b">
           <div class="grid-2" style="gap:18px 28px;">
             <dl class="kv">
+              <dt>Almacén</dt><dd>${almacenChip(it.almacen)}</dd>
               <dt>Descripción</dt><dd>${esc(it.descripcion)}</dd>
               <dt>Marca / modelo / uso</dt><dd>${it.marca_modelo_uso ? esc(it.marca_modelo_uso) : '—'}</dd>
               <dt>Unidad</dt><dd>${esc(it.unidad_medida)}</dd>
@@ -697,7 +744,8 @@ function renderItem() {
           ${sup ? `
             <div class="divider"></div>
             <button class="btn" data-go="#/ajuste?item=${it.id}">${I('sliders')} Ajuste de inventario</button>
-            <button class="btn" id="btnEditar">${I('edit')} Editar item</button>` : ''}
+            <button class="btn" id="btnEditar">${I('edit')} Editar item</button>
+            <button class="btn" id="btnTrasladar" ${it.obsoleto ? 'disabled title="Un obsoleto no se traslada: primero revierte el obsoleto"' : ''}>${I('swap')} Trasladar a ${esc(ALMACEN_LABEL[otroAlmacen(it.almacen)])}</button>` : ''}
           <div class="divider"></div>
           ${it.obsoleto
             ? sup
@@ -727,6 +775,8 @@ function renderItem() {
   if (br) br.onclick = abrirReactivar;
   const be = $('#btnEditar');
   if (be) be.onclick = abrirEditar;
+  const bt = $('#btnTrasladar');
+  if (bt) bt.onclick = abrirTrasladar;
   $$('[data-quitar]').forEach((b) => (b.onclick = () => quitarTransito(transito[Number(b.dataset.quitar)])));
 }
 
@@ -793,12 +843,13 @@ function tablaMovimientos(movs) {
     return `<div class="empty"><div class="ic">${I('swap')}</div><b>Sin movimientos</b>Aún no hay entradas, salidas ni ajustes.</div>`;
   return `
     <table class="tbl">
-      <thead><tr><th>Fecha</th><th>Tipo</th><th class="r">Cantidad</th><th class="r">Stock</th><th>Detalle</th><th>Usuario</th></tr></thead>
+      <thead><tr><th>Fecha</th><th>Tipo</th><th>Almacén</th><th class="r">Cantidad</th><th class="r">Stock</th><th>Detalle</th><th>Usuario</th></tr></thead>
       <tbody>
         ${movs.map((m) => `
         <tr>
           <td class="muted" style="white-space:nowrap;">${esc(m.fecha)}</td>
           <td>${tipoChip(m.tipo)}</td>
+          <td>${almacenChip(m.almacen)}</td>
           <td class="num r ${m.cantidad > 0 ? 'pos' : 'neg'}">${signed(m.cantidad)}</td>
           <td class="num r"><b>${fmt(m.stock_resultante)}</b></td>
           <td>${detalleMovimiento(m)}</td>
@@ -817,6 +868,7 @@ function tablaBitacora(bits) {
     if (b.evento === 'REVERTIR_OBSOLETO') return 'Se revirtió el obsoleto';
     if (b.evento === 'ASIGNAR_TRANSITO') return `Línea en tránsito asignada: <span class="mono">${esc(b.valor_nuevo)}</span>`;
     if (b.evento === 'QUITAR_TRANSITO') return `Se quitó la línea en tránsito: <span class="mono">${esc(b.valor_anterior)}</span>`;
+    if (b.evento === 'TRASLADO') return `Almacén: ${almacenChip(b.valor_anterior)} <span class="muted">→</span> ${almacenChip(b.valor_nuevo)}`;
     const v = (x) => (x === null || x === undefined ? '<span class="muted">—</span>' : `<b>${esc(x)}</b>`);
     return `${esc(CAMPOS[b.campo] || b.campo)}: ${v(b.valor_anterior)} <span class="muted">→</span> ${v(b.valor_nuevo)}`;
   };
@@ -903,10 +955,70 @@ function abrirReactivar() {
   };
 }
 
+/* ---------- traslado entre almacenes (solo supervisor) ---------- */
+function abrirTrasladar() {
+  const it = state.kx.item;
+  const destino = otroAlmacen(it.almacen);
+  openModal(`
+    <div class="modal">
+      <div class="mh"><h3>${I('swap')} Trasladar a ${esc(ALMACEN_LABEL[destino])}</h3>
+        <p class="mono">${esc(it.numero_parte)} · ${esc(it.descripcion)}</p></div>
+      <div class="mb" style="display:flex;flex-direction:column;gap:12px;" id="trsForm">
+        <div class="traslado">
+          <div class="box">${almacenChip(it.almacen, false)}<small>ahora</small></div>
+          <div class="arrow">${I('arrowR')}<span>${fmt(it.stock_activo)} ${esc(it.unidad_medida)}</span></div>
+          <div class="box">${almacenChip(destino, false)}<small>destino</small></div>
+        </div>
+        <div class="banner warn">${I('alert')}<span>Se traslada el item <b>completo</b>: su stock de <b>${fmt(it.stock_activo)}</b> pasa a ${esc(ALMACEN_LABEL[destino])} y deja de estar en ${esc(ALMACEN_LABEL[it.almacen])}. Mueve las piezas físicamente al mismo tiempo.</span></div>
+        <div class="field"><label for="trsMotivo">Motivo<span class="req">*</span></label>
+          <input class="input" id="trsMotivo" data-f placeholder="Ej. la línea de mandriles se movió a Makro" /></div>
+        <p class="form-msg" id="trsMsg"></p>
+      </div>
+      <div class="mf">
+        <button class="btn ghost" data-close>Cancelar</button>
+        <button class="btn primary" id="trsOk">${I('swap')} Trasladar a ${esc(ALMACEN_LABEL[destino])}</button>
+      </div>
+    </div>`);
+  enterAvanza($('#trsForm'), () => $('#trsOk').click());
+  $('#trsOk').onclick = async () => {
+    const msg = $('#trsMsg');
+    msg.textContent = '';
+    const motivo = val('trsMotivo').trim();
+    if (!motivo) return fallo(msg, 'trsMotivo', 'El motivo del traslado es obligatorio: queda en la bitácora.');
+    $('#trsOk').disabled = true;
+    try {
+      await http('POST', `/items/${it.id}/traslado`, { almacen: destino, motivo });
+      closeModal();
+      toast('ok', 'Item trasladado', `${it.numero_parte}: ${ALMACEN_LABEL[it.almacen]} → ${ALMACEN_LABEL[destino]} con ${fmt(it.stock_activo)} ${it.unidad_medida}.`);
+      state.kxTab = 'bit';
+      await recargarItem();
+    } catch (e) {
+      msg.textContent = e.message;
+      $('#trsOk').disabled = false;
+      // Otro supervisor lo trasladó o lo marcaron obsoleto: refresca al cerrar.
+      if (e.status === 409) _modalOnClose = () => recargarItem();
+    }
+  };
+}
+
 /* ---------- alta / edición de items ---------- */
 function itemFormHTML(it, nuevo) {
+  // Almacén: solo en el alta, obligatorio y SIN valor por defecto (que nadie dé
+  // de alta en ATI por descuido un item de Makro). En la edición no se cambia:
+  // para eso está "Trasladar".
+  const almacen = nuevo ? `
+      <div class="field span-2">
+        <label>Almacén<span class="req">*</span></label>
+        <div class="choices alm-pick" id="iAlm">
+          ${ALMACENES.map((a) => `
+          <button type="button" class="choice" data-alm="${a}"><span class="dot"></span>
+            <span><b>${esc(ALMACEN_LABEL[a])}</b><small>El item y su stock inicial quedan en ${esc(ALMACEN_LABEL[a])}.</small></span></button>`).join('')}
+        </div>
+        <span class="hint">Después solo cambia con un traslado de supervisor.</span>
+      </div>` : '';
   return `
     <div class="form-grid" id="itemForm">
+      ${almacen}
       ${campo({ id: 'iNP', label: 'Número de parte', req: true, mono: true, value: it.numero_parte })}
       ${campo({ id: 'iUM', label: 'Unidad de medida', value: it.unidad_medida ?? 'EACH' })}
       ${campo({ id: 'iDesc', label: 'Descripción', req: true, span: true, value: it.descripcion })}
@@ -927,6 +1039,12 @@ function itemFormHTML(it, nuevo) {
 // Lee y valida el formulario de item. null si algo no es válido.
 function leerItemForm(msgEl, nuevo) {
   msgEl.textContent = '';
+  if (nuevo && !ALMACENES.includes($('#iAlm').dataset.v)) {
+    msgEl.textContent = 'Selecciona el almacén del item: ATI o Makro.';
+    $('#iAlm').classList.add('invalid');
+    $('#iAlm [data-alm]').focus();
+    return null;
+  }
   const np = val('iNP').trim();
   const desc = val('iDesc').trim();
   if (!np) return fallo(msgEl, 'iNP', 'El número de parte es obligatorio.');
@@ -952,8 +1070,20 @@ function leerItemForm(msgEl, nuevo) {
     const stock = st === '' ? 0 : parseEntero(st);
     if (stock === null) return fallo(msgEl, 'iStock', 'El stock inicial debe ser un entero de 0 en adelante.');
     datos.stock_inicial = stock;
+    datos.almacen = $('#iAlm').dataset.v;
   }
   return datos;
+}
+
+// Selector de almacén del alta: marca la opción elegida en #iAlm (data-v).
+function montarAlmacenAlta() {
+  const box = $('#iAlm');
+  $$('[data-alm]', box).forEach((b) => (b.onclick = () => {
+    box.dataset.v = b.dataset.alm;
+    box.classList.remove('invalid');
+    $$('[data-alm]', box).forEach((x) => x.classList.toggle('on', x === b));
+    $('#nuevoMsg').textContent = '';
+  }));
 }
 
 function abrirEditar() {
@@ -1004,6 +1134,7 @@ function mountNuevo() {
       <div class="card">
         <div class="card-h"><h3>Antes de dar de alta</h3></div>
         <div class="card-b checklist">
+          <span>${I('checkCircle')} Elige el almacén: ATI o Makro (no hay uno por defecto).</span>
           <span>${I('checkCircle')} El número de parte no puede repetirse.</span>
           <span>${I('checkCircle')} El stock inicial queda en el kardex como ajuste “Carga inicial”.</span>
           <span>${I('checkCircle')} El alta queda en la bitácora a tu nombre.</span>
@@ -1015,6 +1146,7 @@ function mountNuevo() {
       </div>
     </div>
   </div>`;
+  montarAlmacenAlta();
   $('#iNP').focus();
   enterAvanza($('#nuevoRoot'), () => $('#nuevoOk').click());
   $('#nuevoOk').onclick = async () => {
@@ -1023,7 +1155,7 @@ function mountNuevo() {
     $('#nuevoOk').disabled = true;
     try {
       const it = await http('POST', '/items', datos);
-      toast('ok', 'Item dado de alta', `${it.numero_parte} con stock ${fmt(it.stock_activo)}.`);
+      toast('ok', 'Item dado de alta', `${it.numero_parte} en ${ALMACEN_LABEL[it.almacen]} con stock ${fmt(it.stock_activo)}.`);
       state.kxTab = 'mov';
       go(`#/item/${it.id}`);
     } catch (e) {
@@ -1066,7 +1198,7 @@ function mountPicker(el, items, onChange) {
           <div class="info">
             <div class="np">${esc(sel.numero_parte)}</div>
             <div class="desc">${esc(sel.descripcion)}${sel.marca_modelo_uso ? ' · ' + esc(sel.marca_modelo_uso) : ''}</div>
-            <div class="tags">${itemChips(sel)}</div>
+            <div class="tags">${almacenChip(sel.almacen)}${itemChips(sel)}</div>
           </div>
           <div class="right">
             <div class="stk-big"><small>Activo</small><b>${fmt(sel.stock_activo)}<span>${esc(sel.unidad_medida)}</span></b></div>
@@ -1100,7 +1232,7 @@ function mountPicker(el, items, onChange) {
           <button class="pk-opt ${i === idx ? 'sel' : ''}" data-pk="${i}" tabindex="-1">
             <span class="np">${esc(it.numero_parte)}</span>
             <span class="desc">${esc(it.descripcion)}${it.marca_modelo_uso ? ` <small>· ${esc(it.marca_modelo_uso)}</small>` : ''}</span>
-            <span class="stk">${itemChips(it)}${fmt(it.stock_activo)} <span class="muted" style="font-weight:600;">${esc(it.unidad_medida)}</span></span>
+            <span class="stk">${almacenChip(it.almacen)}${itemChips(it)}${fmt(it.stock_activo)} <span class="muted" style="font-weight:600;">${esc(it.unidad_medida)}</span></span>
           </button>`).join('')
         : `<div class="pk-empty">Sin coincidencias para “${esc(q)}”.</div>`;
       list.classList.remove('hidden');
@@ -1203,7 +1335,12 @@ function flowHTML(item, delta) {
     return `<div class="empty" style="padding:16px 8px;"><div class="ic">${I('box')}</div>Selecciona un item para ver su stock.</div>`;
   const fin = delta === null ? null : item.stock_activo + delta;
   const bad = fin !== null && fin < 0;
+  // El almacén en grande: es lo último que ve el almacenista antes de guardar
+  // (los almacenistas rotan de nave; que no le dé salida a una pieza de la otra).
   return `
+    <div class="alm-big alm-${esc(String(item.almacen).toLowerCase())}">
+      ${I('pkg')}<span><small>Almacén</small><b>${esc(ALMACEN_LABEL[item.almacen] || item.almacen)}</b></span>
+    </div>
     <div class="flow">
       <div class="box"><small>Actual</small><b>${fmt(item.stock_activo)}</b></div>
       <div class="arrow">${I('arrowR')}<span class="${delta > 0 ? 'pos' : delta < 0 ? 'neg' : ''}">${delta ? signed(delta) : ''}</span></div>
@@ -1261,7 +1398,7 @@ function setupCaptura({ items, preselect, path, delta, leer, onItem, confirmar: 
         tipo: mov.tipo, np: item.numero_parte, item_id: item.id,
         cantidad: mov.cantidad, stock: mov.stock_resultante, fecha: mov.fecha,
       });
-      toast('ok', okTitulo, `${item.numero_parte}: ${fmt(antes)} → ${fmt(mov.stock_resultante)}`);
+      toast('ok', okTitulo, `${item.numero_parte} (${ALMACEN_LABEL[mov.almacen] || mov.almacen}): ${fmt(antes)} → ${fmt(mov.stock_resultante)}`);
       $$('[data-f]', root).forEach((x) => { if (x.id !== 'pkInput') x.value = ''; });
       renderSesion();
       pk.set(null);
